@@ -395,24 +395,79 @@ def coco_map_via_ultralytics(
     """
     Run Ultralytics faster-coco-eval through DetectionValidator.coco_evaluate().
 
-    IMPORTANT: coco_evaluate has a guard: save_json AND (is_coco OR is_lvis) AND len(jdict) must be true.
-    We satisfy it explicitly here.
+    Comparability/robustness improvements:
+      - Enforces Path inputs (Ultralytics calls .is_file()).
+      - Enforces dataset.im_files presence (Ultralytics builds imgIds from it).
+      - Filters jdict to exactly the evaluated imgIds (important for --limit/subsets).
+      - Forces is_coco/save_json guard flags explicitly.
     """
+    save_dir = Path(save_dir)
+    pred_json = Path(pred_json)
+    anno_json = Path(anno_json)
+
+    if not pred_json.is_file():
+        raise FileNotFoundError(f"pred_json not found: {pred_json}")
+    if not anno_json.is_file():
+        raise FileNotFoundError(f"anno_json not found: {anno_json}")
+    if not jdict:
+        raise ValueError("Empty jdict: no predictions to evaluate.")
+
+    # Ultralytics coco_evaluate uses stems of these paths to build imgIds:
+    # val.params.imgIds = [int(Path(x).stem) for x in self.dataloader.dataset.im_files]
+    im_files = getattr(dataloader.dataset, "im_files", None)
+    if not im_files:
+        raise AttributeError(
+            "dataloader.dataset must expose `im_files` (list of image paths). "
+            "Ultralytics coco_evaluate derives imgIds from these stems."
+        )
+
+    try:
+        eval_img_ids = [int(Path(p).stem) for p in im_files]
+    except Exception as e:
+        raise ValueError(
+            "Failed to parse int image_ids from dataset.im_files stems. "
+            "For COCO val2017, filenames should be like 000000000139.jpg."
+        ) from e
+
+    eval_id_set = set(eval_img_ids)
+
+    # Filter predictions to exactly the images that will be evaluated.
+    # (Extra preds are typically ignored by COCOeval when imgIds is set,
+    #  but filtering avoids confusing edge cases and makes subset runs cleaner.)
+    filtered = []
+    for p in jdict:
+        try:
+            iid = int(p.get("image_id", -1))
+        except Exception:
+            continue
+        if iid in eval_id_set:
+            filtered.append(p)
+
+    if not filtered:
+        raise ValueError(
+            "After filtering predictions to evaluated imgIds, jdict became empty. "
+            "This usually means your prediction image_id mapping does not match "
+            "dataset.im_files stems."
+        )
+
     v = DetectionValidator(
         dataloader=dataloader, save_dir=save_dir, args={"save_json": True}
     )
-    # Satisfy the guard (and avoid relying on Ultralytics' internal dataset sniffing)
+
+    # Satisfy coco_evaluate guard:
     v.is_coco = True
     v.is_lvis = False
-    v.jdict = jdict
-    # In some versions args may be a SimpleNamespace; be defensive
+    v.jdict = filtered
+
+    # Some Ultralytics versions store args differently; be defensive
     try:
         v.args.save_json = True
     except Exception:
         pass
 
     stats: Dict[str, Any] = {}
-    stats = v.coco_evaluate(stats, pred_json=pred_json, anno_json=anno_json, iou_types="bbox", suffix="Box")  # type: ignore
+    # Use Ultralytics defaults for full comparability (iou_types="bbox", suffix="Box" -> "(B)" keys)
+    stats = v.coco_evaluate(stats, pred_json=pred_json, anno_json=anno_json)  # type: ignore
     return stats
 
 
@@ -447,31 +502,59 @@ def set_torchvision_resize(
     model, model_name: str, imgsz: int, max_size: int, resize_mode: str
 ) -> None:
     """
+    Goal: maximize comparability with Ultralytics `imgsz` for val/predict.
+
+    Ultralytics (rect=True, batch=1) effectively:
+      - scales so max(H,W) ~= imgsz (preserve aspect)
+      - applies minimal padding to stride (not full square padding)
+
+    Torchvision equivalent (without editing model code):
+      - set GeneralizedRCNNTransform so that long-side is capped at imgsz:
+            min_size = imgsz
+            max_size = imgsz
+
     resize_mode:
-      - short: set min_size/max_size (aspect-preserving)
-      - fixed: set fixed_size=(imgsz,imgsz) (warps to square)
-      - none: don't touch model.transform (use torchvision defaults)
+      - "short": (REVISED FOR COMPARABILITY) cap long-side at imgsz (aspect-preserving)
+      - "fixed": force warp to (imgsz,imgsz) via fixed_size (NOT letterbox; generally not comparable)
+      - "none": keep torchvision defaults (useful to reproduce official torchvision AP numbers)
     """
     if model_name in FIXED_SIZE_TORCHVISION_MODELS:
-        return  # fixed; nothing to set
+        return  # truly fixed; nothing to set here
 
     if resize_mode == "none":
         return
 
-    # Most torchvision detection models use GeneralizedRCNNTransform with these attrs.
+    t = getattr(model, "transform", None)
+    if t is None:
+        raise AttributeError(
+            f"{model_name} has no .transform; cannot set resize behavior."
+        )
+
+    # Always clear fixed_size unless explicitly requested
+    if hasattr(t, "fixed_size") and t.fixed_size is not None and resize_mode != "fixed":
+        t.fixed_size = None
+
+    # Match Ultralytics imgsz semantics: fit within imgsz with max side capped at imgsz.
     if resize_mode == "short":
-        model.transform.min_size = (int(imgsz),)  # type: ignore[attr-defined]
-        model.transform.max_size = int(max_size)  # type: ignore[attr-defined]
-        # Make sure we don't also warp
-        if getattr(model.transform, "fixed_size", None) is not None:
-            model.transform.fixed_size = None  # type: ignore[attr-defined]
+        # IMPORTANT: ignore max_size_eff ratios (e.g. 1333/800). Those give torchvision *more pixels*
+        # than Ultralytics at the same imgsz and hurt comparability.
+        t.min_size = (int(imgsz),)
+        t.max_size = int(imgsz)
+
+        # Ensure stride-style padding behavior matches common YOLO stride (32).
+        # (Torchvision defaults are usually already 32, but set explicitly for stability.)
+        if hasattr(t, "size_divisible"):
+            t.size_divisible = 32
         return
 
     if resize_mode == "fixed":
-        model.transform.fixed_size = (int(imgsz), int(imgsz))  # type: ignore[attr-defined]
-        # max_size doesn't matter when fixed_size is used, but keep it consistent
-        model.transform.min_size = (int(imgsz),)  # type: ignore[attr-defined]
-        model.transform.max_size = int(max_size)  # type: ignore[attr-defined]
+        # WARNING: This warps aspect ratio. It is NOT the same as YOLO letterbox-to-square.
+        # Use only if you intentionally want "warp-to-square" experiments.
+        t.fixed_size = (int(imgsz), int(imgsz))
+        t.min_size = (int(imgsz),)
+        t.max_size = int(imgsz)
+        if hasattr(t, "size_divisible"):
+            t.size_divisible = 32
         return
 
     raise ValueError(f"Unknown resize_mode: {resize_mode}")
