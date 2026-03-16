@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
 import platform
 import shutil
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
@@ -100,7 +102,7 @@ FIELDNAMES = [
     "benchmark_wall_time_s",
 ]
 METRIC_KEY = "metrics/mAP50-95(B)"
-ARTIFACT_SCHEMA_VERSION = 1
+ARTIFACT_SCHEMA_VERSION = 2
 BENCHMARK_IMPL = "ultralytics_round_robin_artifacts_v4"
 IMAGE_SUFFIXES = {
     ".bmp",
@@ -485,27 +487,124 @@ def file_size_mb(path_str: str) -> Optional[float]:
         return None
 
 
+@lru_cache(maxsize=None)
+def _sha256_for_file(path_str: str, size_bytes: int, mtime_ns: int) -> str:
+    digest = hashlib.sha256()
+    with Path(path_str).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def file_signature(path_like: Union[str, Path]) -> Optional[Dict[str, Any]]:
+    """Return a content-based signature that survives copies and directory moves.
+
+    Earlier revisions stored absolute paths and mtimes in artifact metadata. That made
+    prepared portable artifacts appear invalid after being copied to another machine or
+    relocated inside a different artifact root. The new signature uses the file name,
+    size, and SHA-256 content hash instead.
+    """
     path = Path(path_like).expanduser()
     if not path.exists() or not path.is_file():
         return None
     try:
-        stat = path.stat()
+        resolved = path.resolve()
+        stat = resolved.stat()
     except Exception:
         return None
     return {
-        "path": str(path.resolve()),
+        "name": resolved.name,
         "size_bytes": int(stat.st_size),
-        "mtime_ns": int(stat.st_mtime_ns),
+        "sha256": _sha256_for_file(
+            str(resolved),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+        ),
     }
 
 
 def weights_signature(weights_ref: str) -> Dict[str, Any]:
-    signature = {"weights_ref": str(weights_ref)}
-    file_sig = file_signature(weights_ref)
+    """Return path-independent weight provenance for artifact metadata.
+
+    The stored basename is portable across machines, while the optional file signature
+    keeps strong provenance when the source .pt file is present locally.
+    """
+    path = Path(str(weights_ref)).expanduser()
+    signature: Dict[str, Any] = {"name": path.name or str(weights_ref)}
+    file_sig = file_signature(path)
     if file_sig is not None:
-        signature["file"] = file_sig  # type: ignore
+        signature["file"] = file_sig
     return signature
+
+
+def _path_name_from_value(value: Any) -> str:
+    text = safe_str(value).strip()
+    return Path(text).name if text else ""
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        try:
+            return int(float(str(value)))
+        except Exception:
+            return None
+
+
+def file_signature_matches(stored_signature: Any, path_like: Union[str, Path]) -> bool:
+    """Compare current file content against either v2 or legacy v1 metadata.
+
+    v2 signatures are content-based. Legacy v1 signatures stored path + size + mtime;
+    for those we keep a conservative compatibility path by matching file size and the
+    basename encoded in the old path.
+    """
+    if not isinstance(stored_signature, dict):
+        return False
+    current = file_signature(path_like)
+    if current is None:
+        return False
+
+    stored_sha = safe_str(stored_signature.get("sha256"))
+    if stored_sha:
+        stored_size = _int_or_none(stored_signature.get("size_bytes"))
+        if stored_size is not None and stored_size != int(current["size_bytes"]):
+            return False
+        stored_name = safe_str(stored_signature.get("name"))
+        return stored_sha == safe_str(current.get("sha256")) and (
+            not stored_name or stored_name == safe_str(current.get("name"))
+        )
+
+    stored_size = _int_or_none(stored_signature.get("size_bytes"))
+    if stored_size is None or stored_size != int(current["size_bytes"]):
+        return False
+    stored_name = _path_name_from_value(stored_signature.get("path")) or safe_str(
+        stored_signature.get("name")
+    )
+    current_name = safe_str(current.get("name"))
+    return not stored_name or stored_name == current_name
+
+
+def weights_signature_matches(stored_signature: Any, weights_ref: str) -> bool:
+    if not isinstance(stored_signature, dict):
+        return False
+
+    current = weights_signature(weights_ref)
+    stored_name = safe_str(stored_signature.get("name")) or _path_name_from_value(
+        stored_signature.get("weights_ref")
+    )
+    current_name = safe_str(current.get("name"))
+    if stored_name and current_name and stored_name != current_name:
+        return False
+
+    stored_file_sig = stored_signature.get("file")
+    if stored_file_sig is None:
+        return bool(stored_name) and stored_name == current_name
+    return file_signature_matches(stored_file_sig, weights_ref)
 
 
 def try_ultralytics_version() -> Optional[str]:
@@ -914,21 +1013,28 @@ def portable_artifact_metadata_matches(
     key: ArtifactKey,
     target: Path,
     weights_ref: str,
+    require_weights_signature: bool = True,
 ) -> bool:
     if meta is None:
         return False
-    expected_weights = weights_signature(weights_ref)
-    if int(meta.get("schema_version", 0)) != ARTIFACT_SCHEMA_VERSION:
-        return False
-    return (
+    if not (
         meta.get("portable") is True
         and meta.get("format_key") == key.format_key
         and meta.get("model") == key.model
         and int(meta.get("imgsz", -1)) == int(key.imgsz)
         and bool(meta.get("half")) == bool(key.half)
-        and meta.get("weights_signature") == expected_weights
-        and meta.get("artifact_signature") == file_signature(target)
-    )
+    ):
+        return False
+    if not file_signature_matches(meta.get("artifact_signature"), target):
+        return False
+    if not require_weights_signature:
+        return True
+    stored_weights = meta.get("weights_signature")
+    if meta.get("assumed_existing") and not (
+        isinstance(stored_weights, dict) and stored_weights.get("file") is not None
+    ):
+        return False
+    return weights_signature_matches(stored_weights, weights_ref)
 
 
 def trt_artifact_metadata_matches(
@@ -939,19 +1045,17 @@ def trt_artifact_metadata_matches(
     onnx_path: Path,
     device: str,
 ) -> bool:
+    del weights_ref  # engine reuse is keyed on the local engine + source ONNX + system.
     if meta is None:
         return False
-    expected_weights = weights_signature(weights_ref)
     return (
-        int(meta.get("schema_version", 0)) == ARTIFACT_SCHEMA_VERSION
-        and meta.get("portable") is False
+        meta.get("portable") is False
         and meta.get("format_key") == key.format_key
         and meta.get("model") == key.model
         and int(meta.get("imgsz", -1)) == int(key.imgsz)
         and bool(meta.get("half")) == bool(key.half)
-        and meta.get("weights_signature") == expected_weights
-        and meta.get("artifact_signature") == file_signature(target)
-        and meta.get("source_onnx_signature") == file_signature(onnx_path)
+        and file_signature_matches(meta.get("artifact_signature"), target)
+        and file_signature_matches(meta.get("source_onnx_signature"), onnx_path)
         and meta.get("built_on") == current_trt_system_signature(device)
     )
 
@@ -1040,7 +1144,13 @@ def ensure_portable_artifact(
     ready = (
         target.exists()
         and not args.rebuild_artifacts
-        and portable_artifact_metadata_matches(meta, key, target, weights_ref)
+        and portable_artifact_metadata_matches(
+            meta,
+            key,
+            target,
+            weights_ref,
+            require_weights_signature=(args.mode != "prepared"),
+        )
     )
     if ready:
         return ArtifactInfo(
@@ -1329,16 +1439,20 @@ def eval_signature(
     if artifact_info.artifact_path:
         artifact_signature = file_signature(artifact_info.artifact_path)
 
+    data_signature: Dict[str, Any] = {"name": Path(args.data).name}
+    data_file_sig = file_signature(args.data)
+    if data_file_sig is not None:
+        data_signature["file"] = data_file_sig
+
     return {
         "model": key.model,
         "imgsz": int(key.imgsz),
         "format_key": key.format_key,
         "half": bool(key.half),
-        "data_yaml": str(args.data),
+        "data_signature": data_signature,
         "score_thr": float(args.score_thr),
         "max_det": int(args.max_det),
         "metric_key_default": METRIC_KEY,
-        "weights_signature": weights_signature(artifact_info.weights_ref),
         "artifact_signature": artifact_signature,
     }
 
