@@ -1,26 +1,20 @@
 #!/usr/bin/env python3
 """
-Benchmark torchvision detection models on COCO val2017 with a benchmark layout that is
-as close as practical to Ultralytics benchmark mode:
-  - fixed square imgsz per run
-  - low confidence threshold (0.001)
-  - max_det=100
-  - inference-only timing
-  - COCO mAP50-95 computed via Ultralytics/faster-coco-eval outside the timed region
-  - multiple independent repeats without aggregation
+Refactored torchvision detection benchmark script for efficient repeated runs.
 
-Backends implemented:
-  - PyTorch eager
-  - TorchScript
-  - ONNX (ONNX Runtime)
-  - TensorRT engine (ONNX -> trtexec -> TensorRT runtime)
+Main changes versus the original script:
+- separates export/prepare from benchmark execution with `--mode`
+- caches non-random artifacts on disk (TorchScript / ONNX / TensorRT)
+- reuses one dataloader per image size during a run
+- computes COCO mAP once per deterministic artifact by default (`--eval-policy once`)
+- reuses the first fresh evaluation pass as repeat 1 timing when possible
+- skips already-successful CSV rows by default
+- supports loading pre-exported artifacts produced elsewhere via `--mode benchmark`
 
-Important geometry note:
-Torchvision detection models do not have a built-in benchmark helper equivalent to
-Ultralytics' model.benchmark(). To keep exported formats comparable, this script uses a
-single external aspect-preserving letterbox-to-square preprocessing step for all
-Torchvision backends, then runs model inference on that fixed square tensor. Prediction
-conversion back to original image coordinates happens after the timed region.
+Important portability note:
+- TorchScript and ONNX artifacts can usually be prepared on another machine and copied over.
+- TensorRT engines should be built on the target Jetson unless you are deliberately managing
+  TensorRT compatibility constraints yourself.
 """
 from __future__ import annotations
 
@@ -33,31 +27,15 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import torch
 import yaml
 from PIL import Image
-from pycocotools.coco import COCO
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-
-from torchvision.models.detection import (
-    FasterRCNN_ResNet50_FPN_Weights,
-    MaskRCNN_ResNet50_FPN_Weights,
-    RetinaNet_ResNet50_FPN_Weights,
-    fasterrcnn_resnet50_fpn,
-    maskrcnn_resnet50_fpn,
-    retinanet_resnet50_fpn,
-)
-
-try:
-    from ultralytics.models.yolo.detect.val import DetectionValidator
-except Exception:  # pragma: no cover
-    from ultralytics.models.yolo.detect import DetectionValidator  # type: ignore
-
 
 DEFAULT_MODELS = [
     "fasterrcnn_resnet50_fpn",
@@ -65,12 +43,8 @@ DEFAULT_MODELS = [
     "maskrcnn_resnet50_fpn",
 ]
 DEFAULT_SIZES = [384, 512, 640, 768]
-DEFAULT_FORMATS = [
-    "pytorch",
-    # "torchscript",
-    # "onnx",
-    # "trt",
-]
+DEFAULT_FORMATS = ["pytorch", "torchscript", "onnx", "trt"]
+
 FIELDNAMES = [
     "framework",
     "model",
@@ -104,20 +78,9 @@ FIELDNAMES = [
     "metric_key",
     "benchmark_wall_time_s",
 ]
-MODEL_ZOO = {
-    "fasterrcnn_resnet50_fpn": (
-        fasterrcnn_resnet50_fpn,
-        FasterRCNN_ResNet50_FPN_Weights,
-    ),
-    "retinanet_resnet50_fpn": (
-        retinanet_resnet50_fpn,
-        RetinaNet_ResNet50_FPN_Weights,
-    ),
-    "maskrcnn_resnet50_fpn": (
-        maskrcnn_resnet50_fpn,
-        MaskRCNN_ResNet50_FPN_Weights,
-    ),
-}
+
+SUPPORTED_MODELS = tuple(DEFAULT_MODELS)
+
 FORMAT_TO_NAME = {
     "pytorch": "PyTorch",
     "torchscript": "TorchScript",
@@ -131,6 +94,7 @@ FORMAT_TO_ARG = {
     "trt": "engine",
 }
 METRIC_KEY = "metrics/mAP50-95(B)"
+
 try:
     PIL_BILINEAR = Image.Resampling.BILINEAR  # Pillow >= 9.1
 except AttributeError:  # pragma: no cover
@@ -138,23 +102,95 @@ except AttributeError:  # pragma: no cover
 
 
 @dataclass(frozen=True)
-class RunSpec:
+class ArtifactKey:
     model: str
     imgsz: int
     format_key: str
     half: bool
+
+
+@dataclass(frozen=True)
+class RowKey:
+    framework: str
+    model: str
+    imgsz: int
+    batch: int
+    device: str
     repeat: int
+    half: int
+    precision: str
+    format_name: str
+
+
+@dataclass
+class DatasetBundle:
+    dataset: "CocoLetterboxDataset"
+    dataloader: DataLoader
+    num_images: int
+
+
+@dataclass
+class BaseModelBundle:
+    model: nn.Module
+    wrapper: nn.Module
+    weights: Any
+    weights_desc: str
+    dummy_input: torch.Tensor
+
+
+@dataclass
+class ArtifactInfo:
+    key: ArtifactKey
+    artifact_dir: Path
+    artifact_path: str
+    artifact_size_mb: Optional[float]
+    weights_desc: str
+
+
+@dataclass
+class PreparedBackend:
+    key: ArtifactKey
+    artifact_info: ArtifactInfo
+    backend: str
+    runtime_provider: str
+    benchmark_impl: str
+    infer: Callable[
+        [torch.Tensor],
+        Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], float],
+    ]
+
+
+@dataclass
+class PassResult:
+    mean_inf_ms: float
+    wall_time_s: float
+    num_images: int
+
+
+@dataclass
+class EvalResult(PassResult):
+    ap50_95: float
+    pred_json_path: str
 
 
 class CocoLetterboxDataset(Dataset):
     """COCO val dataset with external fixed-square letterbox preprocessing."""
 
-    def __init__(self, img_dir: Path, anno_json: Path, imgsz: int) -> None:
+    def __init__(
+        self, img_dir: Path, anno_json: Path, imgsz: int, limit: int = 0
+    ) -> None:
+        try:
+            from pycocotools.coco import COCO
+        except Exception as exc:
+            raise RuntimeError("Failed to import pycocotools: %s" % exc)
+
         self.img_dir = img_dir
         self.anno_json = anno_json
         self.imgsz = int(imgsz)
         self.coco = COCO(str(anno_json))
         self.img_ids = sorted(self.coco.getImgIds())
+        if int(limit) > 0:
+            self.img_ids = self.img_ids[: int(limit)]
         self.im_files = [
             str(self.img_dir / self.coco.loadImgs(image_id)[0]["file_name"])
             for image_id in self.img_ids
@@ -195,11 +231,9 @@ class TVDetExportWrapper(nn.Module):
         if batch_images.dim() == 3:
             batch_images = batch_images.unsqueeze(0)
 
-        images = []  # type: List[torch.Tensor]
-        for i in range(batch_images.shape[0]):
-            images.append(batch_images[i])
-
+        images = [batch_images[i] for i in range(batch_images.shape[0])]
         outputs = self.model(images)
+
         batch_size = batch_images.shape[0]
         boxes = batch_images.new_zeros((batch_size, self.max_det, 4))
         scores = batch_images.new_zeros((batch_size, self.max_det))
@@ -225,7 +259,7 @@ class TVDetExportWrapper(nn.Module):
         return boxes, scores, labels, num_det
 
 
-class OnnxRuntimeRunner(object):
+class OnnxRuntimeRunner:
     def __init__(
         self,
         onnx_path: Path,
@@ -246,23 +280,26 @@ class OnnxRuntimeRunner(object):
         self.max_det = int(max_det)
         self.half = bool(half)
         self.dtype_np = np.float16 if self.half else np.float32
+
         providers = ["CPUExecutionProvider"]
         if device.type == "cuda":
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
         self.session = ort.InferenceSession(str(onnx_path), providers=providers)
         self.providers = list(self.session.get_providers())
         self.provider = self.providers[0] if self.providers else ""
         self.input_name = self.session.get_inputs()[0].name
         self.output_names = [output.name for output in self.session.get_outputs()]
-        self.io_binding = None
-        self.input_ortvalue = None
-        self.output_ortvalues = {}  # type: Dict[str, Any]
         self.output_shapes = {
             "boxes": [1, self.max_det, 4],
             "scores": [1, self.max_det],
             "labels": [1, self.max_det],
             "num_det": [1],
         }
+
+        self.io_binding = None
+        self.input_ortvalue = None
+        self.output_ortvalues: Dict[str, Any] = {}
 
         if self.device.type == "cuda" and self.provider == "CUDAExecutionProvider":
             device_id = cuda_device_index(device)
@@ -337,7 +374,7 @@ class OnnxRuntimeRunner(object):
         return (boxes, scores, labels, num_det), inf_ms
 
 
-class TensorRTRunner(object):
+class TensorRTRunner:
     def __init__(self, engine_path: Path, device: torch.device, imgsz: int) -> None:
         if device.type != "cuda":
             raise RuntimeError("TensorRT benchmark requires a CUDA device.")
@@ -359,13 +396,14 @@ class TensorRTRunner(object):
             raise RuntimeError(
                 "Failed to deserialize TensorRT engine: %s" % engine_path
             )
+
         self.context = self.engine.create_execution_context()
         if self.context is None:
             raise RuntimeError("Failed to create TensorRT execution context.")
 
-        self.output_tensors = {}  # type: Dict[str, torch.Tensor]
-        self.input_tensor = None  # type: Optional[torch.Tensor]
-        self.binding_addresses = None  # type: Optional[List[int]]
+        self.output_tensors: Dict[str, torch.Tensor] = {}
+        self.input_tensor: Optional[torch.Tensor] = None
+        self.binding_addresses: Optional[List[int]] = None
         self.use_v3_api = hasattr(self.engine, "num_io_tensors")
         self._prepare_bindings()
 
@@ -376,22 +414,25 @@ class TensorRTRunner(object):
                 self.engine.get_tensor_name(i)
                 for i in range(self.engine.num_io_tensors)
             ]
-            self.input_name = None  # type: Optional[str]
-            self.output_names = []  # type: List[str]
+            self.input_name: Optional[str] = None
+            self.output_names: List[str] = []
             for name in tensor_names:
                 mode = self.engine.get_tensor_mode(name)
                 if mode == trt.TensorIOMode.INPUT:  # type: ignore
                     self.input_name = name
                 else:
                     self.output_names.append(name)
+
             if self.input_name is None:
                 raise RuntimeError("TensorRT engine has no input tensor.")
+
             try:
                 self.context.set_input_shape(
                     self.input_name, (1, 3, self.imgsz, self.imgsz)
                 )
             except Exception:
                 pass
+
             input_shape = tuple(
                 int(x) for x in self.context.get_tensor_shape(self.input_name)
             )
@@ -404,6 +445,7 @@ class TensorRTRunner(object):
             self.context.set_tensor_address(
                 self.input_name, int(self.input_tensor.data_ptr())
             )
+
             for name in self.output_names:
                 output_shape = tuple(
                     int(x) for x in self.context.get_tensor_shape(name)
@@ -417,8 +459,8 @@ class TensorRTRunner(object):
                 self.output_tensors[name] = output_tensor
                 self.context.set_tensor_address(name, int(output_tensor.data_ptr()))
         else:
-            self.input_index = None  # type: Optional[int]
-            self.output_names = []  # type: List[str]
+            self.input_index: Optional[int] = None
+            self.output_names = []
             self.binding_addresses = [0 for _ in range(int(self.engine.num_bindings))]
             for binding_index in range(int(self.engine.num_bindings)):
                 name = self.engine.get_binding_name(binding_index)
@@ -426,14 +468,17 @@ class TensorRTRunner(object):
                     self.input_index = binding_index
                 else:
                     self.output_names.append(name)
+
             if self.input_index is None:
                 raise RuntimeError("TensorRT engine has no input binding.")
+
             try:
                 self.context.set_binding_shape(
                     self.input_index, (1, 3, self.imgsz, self.imgsz)
                 )
             except Exception:
                 pass
+
             input_shape = tuple(
                 int(x) for x in self.context.get_binding_shape(self.input_index)
             )
@@ -444,6 +489,7 @@ class TensorRTRunner(object):
                 input_shape, device=self.device, dtype=input_dtype
             )
             self.binding_addresses[self.input_index] = int(self.input_tensor.data_ptr())
+
             for binding_index in range(int(self.engine.num_bindings)):
                 if self.engine.binding_is_input(binding_index):
                     continue
@@ -485,10 +531,12 @@ class TensorRTRunner(object):
         self, batch_images: torch.Tensor
     ) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], float]:
         assert self.input_tensor is not None
-        input_dtype = self.input_tensor.dtype
-        batch_gpu = batch_images.to(self.device, dtype=input_dtype, non_blocking=True)
+        batch_gpu = batch_images.to(
+            self.device, dtype=self.input_tensor.dtype, non_blocking=True
+        )
         self.input_tensor.copy_(batch_gpu)
         sync_if_cuda(self.device)
+
         start = time.perf_counter()
         self._execute()
         sync_if_cuda(self.device)
@@ -507,93 +555,139 @@ class TensorRTRunner(object):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark torchvision detection models with a fixed-output export path comparable to Ultralytics benchmark mode."
+        description="Efficient torchvision benchmark with artifact preparation and reuse."
     )
+    parser.add_argument("--data", type=Path, default=Path("configs/coco.yaml"))
     parser.add_argument(
-        "--data",
-        type=Path,
-        default=Path("configs/coco.yaml"),
-        help="Ultralytics-style dataset YAML (default: configs/coco.yaml)",
+        "--mode",
+        choices=["prepare", "benchmark", "full"],
+        default="full",
+        help="prepare: only export/build artifacts, benchmark: only use existing artifacts, full: prepare missing artifacts then benchmark.",
     )
     parser.add_argument(
         "--models",
         nargs="+",
         default=list(DEFAULT_MODELS),
-        choices=sorted(MODEL_ZOO.keys()),
+        choices=sorted(SUPPORTED_MODELS),
         help="Torchvision models to benchmark.",
     )
-    parser.add_argument(
-        "--imgsz",
-        nargs="+",
-        type=int,
-        default=list(DEFAULT_SIZES),
-        help="One or more square benchmark sizes.",
-    )
+    parser.add_argument("--imgsz", nargs="+", type=int, default=list(DEFAULT_SIZES))
     parser.add_argument(
         "--formats",
         nargs="+",
         default=list(DEFAULT_FORMATS),
         choices=sorted(FORMAT_TO_NAME.keys()),
-        help="Benchmark formats to run.",
     )
-    parser.add_argument(
-        "--repeats",
-        type=int,
-        default=2,
-        help="Number of independent benchmark repeats per model/size/format/precision.",
-    )
+    parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument(
         "--include-half",
         dest="include_half",
         action="store_true",
         default=True,
-        help="Include FP16 rows in addition to FP32 rows (default: enabled).",
+        help="Include FP16 rows (CUDA only).",
     )
-    parser.add_argument(
-        "--no-include-half",
-        dest="include_half",
-        action="store_false",
-        help="Disable FP16 rows.",
-    )
-    parser.add_argument(
-        "--batch",
-        type=int,
-        default=1,
-        help="Benchmark batch size. This script keeps batch=1 for parity with Ultralytics benchmark mode.",
-    )
-    parser.add_argument("--device", default="0", help='0, "cuda:0", or "cpu"')
+    parser.add_argument("--no-include-half", dest="include_half", action="store_false")
+    parser.add_argument("--batch", type=int, default=1)
+    parser.add_argument("--device", default="auto", help='auto, 0, "cuda:0", or "cpu"')
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument(
-        "--project",
-        type=str,
-        default="runs/val_bench",
-        help="Output root folder.",
-    )
-    parser.add_argument("--out-csv", type=Path, default=Path("val_jetson_test.csv"))
-    parser.add_argument(
-        "--exist-ok",
-        dest="exist_ok",
+        "--persistent-workers",
+        dest="persistent_workers",
         action="store_true",
         default=True,
-        help="Reuse existing run folders (default: enabled).",
+        help="Keep dataloader workers alive across repeated passes for the same image size.",
     )
     parser.add_argument(
-        "--no-exist-ok",
-        dest="exist_ok",
-        action="store_false",
-        help="Fail if a run folder already exists.",
+        "--no-persistent-workers", dest="persistent_workers", action="store_false"
     )
-    parser.add_argument("--warmup", type=int, default=100)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument(
+        "--artifact-root",
+        type=Path,
+        default=Path("bench_cache_torchvision"),
+        help="Root directory for reusable exported artifacts and cached accuracy results.",
+    )
+    parser.add_argument(
+        "--out-csv", type=Path, default=Path("benchmark_torchvision.csv")
+    )
+    parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--score-thr", type=float, default=0.001)
     parser.add_argument("--max-det", type=int, default=100)
     parser.add_argument(
         "--limit", type=int, default=0, help="Debug: evaluate only the first N images."
     )
     parser.add_argument(
+        "--eval-policy",
+        choices=["once", "every-repeat"],
+        default="once",
+        help="once: compute COCO mAP once per deterministic artifact and reuse it across repeats.",
+    )
+    parser.add_argument(
+        "--reuse-eval-as-first-repeat",
+        dest="reuse_eval_as_first_repeat",
+        action="store_true",
+        default=True,
+        help="When eval-policy=once and accuracy is freshly computed, reuse that pass as repeat 1 timing.",
+    )
+    parser.add_argument(
+        "--no-reuse-eval-as-first-repeat",
+        dest="reuse_eval_as_first_repeat",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--reuse-accuracy-cache",
+        dest="reuse_accuracy_cache",
+        action="store_true",
+        default=True,
+        help="Reuse metrics.json when the artifact and eval settings match.",
+    )
+    parser.add_argument(
+        "--no-reuse-accuracy-cache", dest="reuse_accuracy_cache", action="store_false"
+    )
+    parser.add_argument(
+        "--resume",
+        dest="skip_existing",
+        action="store_true",
+        default=True,
+        help="Resume by skipping CSV rows that already succeeded for the same repeat/spec/device.",
+    )
+    parser.add_argument("--no-resume", dest="skip_existing", action="store_false")
+    parser.add_argument(
+        "--skip-existing",
+        dest="skip_existing",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--no-skip-existing",
+        dest="skip_existing",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--rebuild-artifacts",
+        action="store_true",
+        help="Force regeneration of exported artifacts even if they already exist.",
+    )
+    parser.add_argument(
         "--onnx-opset",
         type=int,
         default=0,
         help="ONNX opset to export with. 0 means auto-select a best-effort value.",
+    )
+    parser.add_argument(
+        "--progress",
+        dest="progress",
+        action="store_true",
+        default=True,
+        help="Show tqdm progress bars during benchmark passes.",
+    )
+    parser.add_argument("--no-progress", dest="progress", action="store_false")
+    parser.add_argument(
+        "--trtexec",
+        type=str,
+        default="",
+        help="Optional explicit path to trtexec.",
     )
     return parser.parse_args()
 
@@ -618,6 +712,40 @@ def printable(value: Any) -> str:
             return "nan"
         return "%.4f" % value
     return str(value)
+
+
+def precision_name(half: bool) -> str:
+    return "fp16" if half else "fp32"
+
+
+def run_name_for(key: ArtifactKey, repeat: int) -> str:
+    return "torchvision_{model}_img{imgsz}_{fmt}_{prec}_r{repeat}".format(
+        model=key.model,
+        imgsz=key.imgsz,
+        fmt=key.format_key,
+        prec=precision_name(key.half),
+        repeat=repeat,
+    )
+
+
+def spec_row_key(
+    framework: str, key: ArtifactKey, args: argparse.Namespace, repeat: int
+) -> RowKey:
+    return RowKey(
+        framework=framework,
+        model=key.model,
+        imgsz=int(key.imgsz),
+        batch=int(args.batch),
+        device=str(args.device),
+        repeat=int(repeat),
+        half=int(key.half),
+        precision=precision_name(key.half),
+        format_name=FORMAT_TO_NAME[key.format_key],
+    )
+
+
+def safe_str(value: Any) -> str:
+    return "" if value is None else str(value)
 
 
 def ensure_csv_schema(out_csv: Path) -> None:
@@ -657,6 +785,37 @@ def write_csv(rows: Iterable[Dict[str, Any]], out_csv: Path) -> None:
         for row in rows:
             writer.writerow(row)
         handle.flush()
+
+
+def load_existing_success_keys(out_csv: Path) -> Set[RowKey]:
+    out_csv = out_csv.expanduser().resolve()
+    keys: Set[RowKey] = set()
+    if not out_csv.exists():
+        return keys
+    try:
+        with out_csv.open("r", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                if safe_str(row.get("status")).strip().lower() != "success":
+                    continue
+                try:
+                    key = RowKey(
+                        framework=safe_str(row.get("framework")),
+                        model=safe_str(row.get("model")),
+                        imgsz=int(float(safe_str(row.get("imgsz")))),
+                        batch=int(float(safe_str(row.get("batch")))),
+                        device=safe_str(row.get("device")),
+                        repeat=int(float(safe_str(row.get("repeat")))),
+                        half=int(float(safe_str(row.get("half")) or "0")),
+                        precision=safe_str(row.get("precision")),
+                        format_name=safe_str(row.get("format_name")),
+                    )
+                    keys.add(key)
+                except Exception:
+                    continue
+    except Exception:
+        return set()
+    return keys
 
 
 def resolve_coco_from_ultralytics_yaml(data_yaml: Path) -> Tuple[Path, Path]:
@@ -702,8 +861,7 @@ def resolve_coco_from_ultralytics_yaml(data_yaml: Path) -> Tuple[Path, Path]:
             lines = [line.strip() for line in handle if line.strip()]
         if not lines:
             raise ValueError("Empty val txt file: %s" % val_path)
-        img_dir = root / Path(lines[0])
-        img_dir = img_dir.parent
+        img_dir = Path(lines[0]).expanduser().resolve().parent
     else:
         img_dir = val_path
 
@@ -745,6 +903,8 @@ def letterbox_pil_to_tensor(
 
 
 def pick_device(device: Any) -> torch.device:
+    if isinstance(device, str) and device.strip().lower() == "auto":
+        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     if isinstance(device, str) and device.isdigit():
         device = int(device)
     if isinstance(device, int):
@@ -799,7 +959,11 @@ def trt_dtype_to_torch(dtype: Any, trt_module: Any) -> torch.dtype:
     return mapping[dtype]
 
 
-def find_trtexec() -> Optional[str]:
+def find_trtexec(explicit: str = "") -> Optional[str]:
+    if explicit:
+        path = Path(explicit).expanduser()
+        if path.exists():
+            return str(path)
     candidate = shutil.which("trtexec")
     if candidate:
         return candidate
@@ -863,6 +1027,43 @@ def infer_best_onnx_opset(cuda_enabled: bool) -> int:
     return max(11, int(opset))
 
 
+def get_model_builder(model_name: str) -> Tuple[Any, Any]:
+    try:
+        from torchvision.models.detection import (
+            FasterRCNN_ResNet50_FPN_Weights,
+            MaskRCNN_ResNet50_FPN_Weights,
+            RetinaNet_ResNet50_FPN_Weights,
+            fasterrcnn_resnet50_fpn,
+            maskrcnn_resnet50_fpn,
+            retinanet_resnet50_fpn,
+        )
+    except Exception as exc:
+        raise RuntimeError("Failed to import torchvision detection models: %s" % exc)
+
+    mapping = {
+        "fasterrcnn_resnet50_fpn": (
+            fasterrcnn_resnet50_fpn,
+            FasterRCNN_ResNet50_FPN_Weights,
+        ),
+        "retinanet_resnet50_fpn": (
+            retinanet_resnet50_fpn,
+            RetinaNet_ResNet50_FPN_Weights,
+        ),
+        "maskrcnn_resnet50_fpn": (
+            maskrcnn_resnet50_fpn,
+            MaskRCNN_ResNet50_FPN_Weights,
+        ),
+    }
+    if model_name not in mapping:
+        raise KeyError("Unknown model: %s" % model_name)
+    return mapping[model_name]
+
+
+def get_weights_default(model_name: str) -> Any:
+    _, weights_enum = get_model_builder(model_name)
+    return weights_enum.DEFAULT
+
+
 def build_model(
     model_name: str,
     device: torch.device,
@@ -871,10 +1072,7 @@ def build_model(
     imgsz: int,
     half: bool,
 ) -> Tuple[nn.Module, Any]:
-    if model_name not in MODEL_ZOO:
-        raise KeyError("Unknown model: %s" % model_name)
-
-    ctor, weights_enum = MODEL_ZOO[model_name]
+    ctor, weights_enum = get_model_builder(model_name)
     weights = weights_enum.DEFAULT
     model = ctor(weights=weights).eval().to(device)
 
@@ -901,11 +1099,36 @@ def build_model(
     return model, weights
 
 
-def build_label_to_coco_catid(weights: Any, coco: COCO) -> Dict[int, int]:
+def build_base_model_bundle(
+    key: ArtifactKey, args: argparse.Namespace, device: torch.device
+) -> BaseModelBundle:
+    model, weights = build_model(
+        key.model,
+        device=device,
+        score_thr=float(args.score_thr),
+        max_det=int(args.max_det),
+        imgsz=int(key.imgsz),
+        half=bool(key.half),
+    )
+    wrapper = TVDetExportWrapper(model, int(args.max_det)).eval().to(device)
+    dummy_dtype = torch.float16 if key.half else torch.float32
+    dummy_input = torch.zeros(
+        (1, 3, int(key.imgsz), int(key.imgsz)), device=device, dtype=dummy_dtype
+    )
+    return BaseModelBundle(
+        model=model,
+        wrapper=wrapper,
+        weights=weights,
+        weights_desc=weights_descriptor(weights),
+        dummy_input=dummy_input,
+    )
+
+
+def build_label_to_coco_catid(weights: Any, coco: Any) -> Dict[int, int]:
     categories = list(weights.meta["categories"])
     coco_cats = coco.loadCats(coco.getCatIds())
     name_to_coco_id = dict((cat["name"], int(cat["id"])) for cat in coco_cats)
-    mapping = {}  # type: Dict[int, int]
+    mapping: Dict[int, int] = {}
     for label_index, name in enumerate(categories):
         if name == "__background__":
             continue
@@ -951,7 +1174,7 @@ def fixed_outputs_to_coco_json(
     labels = labels.to(dtype=torch.int32)
     num_det = num_det.to(dtype=torch.int32)
 
-    results = []  # type: List[Dict[str, Any]]
+    results: List[Dict[str, Any]] = []
     batch_size = len(image_ids)
     for batch_index in range(batch_size):
         n = min(int(num_det[batch_index].item()), int(max_det))
@@ -1020,25 +1243,19 @@ def run_torch_module(
 
 def export_torchscript(
     wrapper: nn.Module, dummy_input: torch.Tensor, out_path: Path, device: torch.device
-) -> Any:
+) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     traced = torch.jit.trace(wrapper, dummy_input, strict=False)
     traced = torch.jit.freeze(traced.eval())  # type: ignore
     traced.save(str(out_path))
-    loaded = torch.jit.load(str(out_path), map_location=device)
-    loaded = loaded.eval()
-    try:
-        loaded = torch.jit.freeze(loaded)
-    except Exception:
-        pass
-    return loaded
+    _ = torch.jit.load(str(out_path), map_location=device)  # smoke test
 
 
 def export_onnx(
     wrapper: nn.Module, dummy_input: torch.Tensor, out_path: Path, opset: int
 ) -> None:
     try:
-        import onnx  # noqa: F401  # validate dependency presence before export
+        import onnx  # noqa: F401
     except Exception as exc:
         raise RuntimeError("Failed to import onnx: %s" % exc)
 
@@ -1064,16 +1281,16 @@ def export_onnx(
         raise RuntimeError("ONNX export validation failed: %s" % exc)
 
 
-def build_tensorrt_engine(onnx_path: Path, engine_path: Path, half: bool) -> None:
-    trtexec = find_trtexec()
-    if not trtexec:
-        raise RuntimeError(
-            "trtexec was not found in PATH or common TensorRT install locations."
-        )
+def build_tensorrt_engine(
+    onnx_path: Path, engine_path: Path, half: bool, trtexec: str = ""
+) -> None:
+    trtexec_path = find_trtexec(trtexec)
+    if not trtexec_path:
+        raise RuntimeError("trtexec was not found in PATH or the supplied path.")
 
     engine_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
-        trtexec,
+        trtexec_path,
         "--onnx=%s" % onnx_path,
         "--saveEngine=%s" % engine_path,
         "--skipInference",
@@ -1085,10 +1302,9 @@ def build_tensorrt_engine(onnx_path: Path, engine_path: Path, half: bool) -> Non
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
     if result.returncode != 0:
-        combined = (result.stdout or "") + "\n" + (result.stderr or "")
+        combined = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
         raise RuntimeError(
-            "trtexec failed with exit code %s\n%s"
-            % (result.returncode, combined.strip())
+            "trtexec failed with exit code %s\n%s" % (result.returncode, combined)
         )
     if not engine_path.exists():
         raise RuntimeError("TensorRT engine was not created: %s" % engine_path)
@@ -1101,6 +1317,16 @@ def coco_map_via_ultralytics(
     anno_json: Path,
     jdict: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    try:
+        from ultralytics.models.yolo.detect.val import DetectionValidator
+    except Exception:
+        try:
+            from ultralytics.models.yolo.detect import DetectionValidator  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to import Ultralytics DetectionValidator: %s" % exc
+            )
+
     save_dir = Path(save_dir)
     pred_json = Path(pred_json)
     anno_json = Path(anno_json)
@@ -1118,12 +1344,12 @@ def coco_map_via_ultralytics(
             "dataloader.dataset must expose im_files for Ultralytics COCO evaluation."
         )
 
-    eval_img_ids = []  # type: List[int]
+    eval_img_ids: List[int] = []
     for path in im_files:
         eval_img_ids.append(int(Path(path).stem))
     eval_set = set(eval_img_ids)
 
-    filtered = []  # type: List[Dict[str, Any]]
+    filtered: List[Dict[str, Any]] = []
     for pred in jdict:
         try:
             image_id = int(pred.get("image_id", -1))
@@ -1147,39 +1373,501 @@ def coco_map_via_ultralytics(
         validator.args.save_json = True
     except Exception:
         pass
-    stats = {}  # type: Dict[str, Any]
+
+    stats: Dict[str, Any] = {}
     stats = validator.coco_evaluate(stats, pred_json=pred_json, anno_json=anno_json)  # type: ignore
     return stats
 
 
-def build_error_row(
-    spec: RunSpec, args: argparse.Namespace, error: str
-) -> Dict[str, Any]:
-    precision = "fp16" if spec.half else "fp32"
-    format_name = FORMAT_TO_NAME[spec.format_key]
-    run_name = "torchvision_{model}_img{imgsz}_{fmt}_{prec}_r{repeat}".format(
-        model=spec.model,
-        imgsz=spec.imgsz,
-        fmt=spec.format_key,
-        prec=precision,
-        repeat=spec.repeat,
+def artifact_base_dir(args: argparse.Namespace, key: ArtifactKey) -> Path:
+    return (
+        args.artifact_root.expanduser().resolve()
+        / key.model
+        / ("img%d" % int(key.imgsz))
+        / precision_name(key.half)
+        / key.format_key
     )
-    save_dir = str(Path(args.project).expanduser().resolve() / run_name)
+
+
+def artifact_file_path(args: argparse.Namespace, key: ArtifactKey) -> Optional[Path]:
+    base = artifact_base_dir(args, key)
+    if key.format_key == "torchscript":
+        return base / (key.model + ".torchscript")
+    if key.format_key == "onnx":
+        return base / (key.model + ".onnx")
+    if key.format_key == "trt":
+        return base / (key.model + ".engine")
+    return None
+
+
+def canonical_onnx_path(args: argparse.Namespace, key: ArtifactKey) -> Path:
+    onnx_key = ArtifactKey(
+        model=key.model, imgsz=key.imgsz, format_key="onnx", half=key.half
+    )
+    return artifact_file_path(args, onnx_key)  # type: ignore[return-value]
+
+
+def metrics_json_path(args: argparse.Namespace, key: ArtifactKey) -> Path:
+    return artifact_base_dir(args, key) / "metrics.json"
+
+
+def predictions_json_path(args: argparse.Namespace, key: ArtifactKey) -> Path:
+    return artifact_base_dir(args, key) / "predictions.json"
+
+
+def ensure_artifact(
+    key: ArtifactKey,
+    args: argparse.Namespace,
+    device: torch.device,
+    base_bundle: Optional[BaseModelBundle],
+) -> ArtifactInfo:
+    artifact_dir = artifact_base_dir(args, key)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path_obj = artifact_file_path(args, key)
+
+    if key.format_key == "pytorch":
+        if base_bundle is None:
+            weights_desc = weights_descriptor(get_weights_default(key.model))
+        else:
+            weights_desc = base_bundle.weights_desc
+        return ArtifactInfo(
+            key=key,
+            artifact_dir=artifact_dir,
+            artifact_path="",
+            artifact_size_mb=None,
+            weights_desc=weights_desc,
+        )
+
+    if artifact_path_obj is None:
+        raise RuntimeError("Unsupported format key: %s" % key.format_key)
+
+    if artifact_path_obj.exists() and not args.rebuild_artifacts:
+        if base_bundle is None:
+            weights_desc = weights_descriptor(get_weights_default(key.model))
+        else:
+            weights_desc = base_bundle.weights_desc
+        return ArtifactInfo(
+            key=key,
+            artifact_dir=artifact_dir,
+            artifact_path=str(artifact_path_obj),
+            artifact_size_mb=file_size_mb(str(artifact_path_obj)),
+            weights_desc=weights_desc,
+        )
+
+    if base_bundle is None:
+        raise RuntimeError(
+            "Artifact %s is missing and no base model bundle is available to prepare it."
+            % artifact_path_obj
+        )
+
+    if key.format_key == "torchscript":
+        export_torchscript(
+            base_bundle.wrapper, base_bundle.dummy_input, artifact_path_obj, device
+        )
+    elif key.format_key == "onnx":
+        opset = (
+            int(args.onnx_opset)
+            if int(args.onnx_opset) > 0
+            else infer_best_onnx_opset(device.type == "cuda")
+        )
+        export_onnx(
+            base_bundle.wrapper, base_bundle.dummy_input, artifact_path_obj, opset
+        )
+    elif key.format_key == "trt":
+        if device.type != "cuda":
+            raise RuntimeError("TensorRT preparation requires a CUDA device.")
+        onnx_path = canonical_onnx_path(args, key)
+        if args.rebuild_artifacts or not onnx_path.exists():
+            opset = (
+                int(args.onnx_opset)
+                if int(args.onnx_opset) > 0
+                else infer_best_onnx_opset(device.type == "cuda")
+            )
+            onnx_path.parent.mkdir(parents=True, exist_ok=True)
+            export_onnx(base_bundle.wrapper, base_bundle.dummy_input, onnx_path, opset)
+        build_tensorrt_engine(
+            onnx_path, artifact_path_obj, key.half, trtexec=str(args.trtexec or "")
+        )
+    else:
+        raise RuntimeError("Unsupported format key: %s" % key.format_key)
+
+    return ArtifactInfo(
+        key=key,
+        artifact_dir=artifact_dir,
+        artifact_path=str(artifact_path_obj),
+        artifact_size_mb=file_size_mb(str(artifact_path_obj)),
+        weights_desc=base_bundle.weights_desc,
+    )
+
+
+def load_backend(
+    key: ArtifactKey,
+    args: argparse.Namespace,
+    device: torch.device,
+    artifact_info: ArtifactInfo,
+    base_bundle: Optional[BaseModelBundle],
+) -> PreparedBackend:
+    if key.half and device.type != "cuda":
+        raise RuntimeError(
+            "FP16 benchmarking is only enabled for CUDA devices in this script."
+        )
+    if key.format_key == "trt" and device.type != "cuda":
+        raise RuntimeError("TensorRT benchmarking requires a CUDA device.")
+
+    if key.format_key == "pytorch":
+        if base_bundle is None:
+            raise RuntimeError(
+                "PyTorch eager benchmarking requires a base model bundle."
+            )
+        warmup_torch_module(
+            base_bundle.wrapper,
+            device,
+            int(key.imgsz),
+            bool(key.half),
+            int(args.warmup),
+        )
+
+        def infer(
+            batch_images: torch.Tensor,
+        ) -> Tuple[
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], float
+        ]:
+            return run_torch_module(
+                base_bundle.wrapper, batch_images, device, bool(key.half)
+            )
+
+        return PreparedBackend(
+            key=key,
+            artifact_info=artifact_info,
+            backend="pytorch_eager",
+            runtime_provider=str(device),
+            benchmark_impl="torchvision_cached_benchmark_v3",
+            infer=infer,
+        )
+
+    artifact_path = Path(artifact_info.artifact_path)
+    if not artifact_path.exists():
+        raise FileNotFoundError("Expected artifact not found: %s" % artifact_path)
+
+    if key.format_key == "torchscript":
+        script_module = torch.jit.load(str(artifact_path), map_location=device).eval()
+        try:
+            script_module = torch.jit.freeze(script_module)
+        except Exception:
+            pass
+        warmup_torch_module(
+            script_module, device, int(key.imgsz), bool(key.half), int(args.warmup)
+        )
+
+        def infer(
+            batch_images: torch.Tensor,
+        ) -> Tuple[
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], float
+        ]:
+            return run_torch_module(script_module, batch_images, device, bool(key.half))
+
+        return PreparedBackend(
+            key=key,
+            artifact_info=artifact_info,
+            backend="torchscript",
+            runtime_provider=str(device),
+            benchmark_impl="torchvision_cached_benchmark_v3",
+            infer=infer,
+        )
+
+    if key.format_key == "onnx":
+        onnx_runner = OnnxRuntimeRunner(
+            artifact_path, device, int(key.imgsz), int(args.max_det), bool(key.half)
+        )
+        if key.half and onnx_runner.provider != "CUDAExecutionProvider":
+            raise RuntimeError(
+                "FP16 ONNX benchmark requires ONNX Runtime CUDAExecutionProvider; got '%s'."
+                % onnx_runner.provider
+            )
+        onnx_runner.warmup(int(args.warmup))
+
+        def infer(
+            batch_images: torch.Tensor,
+        ) -> Tuple[
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], float
+        ]:
+            return onnx_runner.run(batch_images)
+
+        return PreparedBackend(
+            key=key,
+            artifact_info=artifact_info,
+            backend="onnxruntime",
+            runtime_provider=onnx_runner.provider,
+            benchmark_impl="torchvision_cached_benchmark_v3",
+            infer=infer,
+        )
+
+    if key.format_key == "trt":
+        trt_runner = TensorRTRunner(artifact_path, device, int(key.imgsz))
+        trt_runner.warmup(int(args.warmup))
+
+        def infer(
+            batch_images: torch.Tensor,
+        ) -> Tuple[
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], float
+        ]:
+            return trt_runner.run(batch_images)
+
+        return PreparedBackend(
+            key=key,
+            artifact_info=artifact_info,
+            backend="tensorrt",
+            runtime_provider="tensorrt",
+            benchmark_impl="torchvision_cached_benchmark_v3",
+            infer=infer,
+        )
+
+    raise RuntimeError("Unsupported format key: %s" % key.format_key)
+
+
+def build_dataset_bundle(
+    imgsz: int,
+    img_dir: Path,
+    anno_json: Path,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> DatasetBundle:
+    dataset = CocoLetterboxDataset(
+        img_dir=img_dir, anno_json=anno_json, imgsz=int(imgsz), limit=int(args.limit)
+    )
+    loader_kwargs: Dict[str, Any] = {
+        "batch_size": 1,
+        "shuffle": False,
+        "num_workers": int(args.workers),
+        "pin_memory": (device.type == "cuda"),
+        "collate_fn": collate_fn,
+    }
+    if int(args.workers) > 0:
+        loader_kwargs["persistent_workers"] = bool(args.persistent_workers)
+        loader_kwargs["prefetch_factor"] = int(args.prefetch_factor)
+    dataloader = DataLoader(dataset, **loader_kwargs)
+    return DatasetBundle(
+        dataset=dataset, dataloader=dataloader, num_images=len(dataset)
+    )
+
+
+def eval_signature(
+    key: ArtifactKey,
+    img_dir: Path,
+    anno_json: Path,
+    args: argparse.Namespace,
+    artifact_info: ArtifactInfo,
+) -> Dict[str, Any]:
+    artifact_stamp_size = None
+    artifact_stamp_mtime_ns = None
+    if artifact_info.artifact_path:
+        artifact_path_obj = Path(artifact_info.artifact_path)
+        if artifact_path_obj.exists():
+            try:
+                stat = artifact_path_obj.stat()
+                artifact_stamp_size = int(stat.st_size)
+                artifact_stamp_mtime_ns = int(stat.st_mtime_ns)
+            except Exception:
+                artifact_stamp_size = None
+                artifact_stamp_mtime_ns = None
+
+    return {
+        "model": key.model,
+        "imgsz": int(key.imgsz),
+        "format_key": key.format_key,
+        "half": bool(key.half),
+        "data_yaml": str(args.data.expanduser().resolve()),
+        "img_dir": str(img_dir.expanduser().resolve()),
+        "anno_json": str(anno_json.expanduser().resolve()),
+        "score_thr": float(args.score_thr),
+        "max_det": int(args.max_det),
+        "limit": int(args.limit),
+        "metric_key": METRIC_KEY,
+        "weights_desc": artifact_info.weights_desc,
+        "artifact_path": str(artifact_info.artifact_path),
+        "artifact_size_bytes": artifact_stamp_size,
+        "artifact_mtime_ns": artifact_stamp_mtime_ns,
+    }
+
+
+def load_cached_metrics(
+    key: ArtifactKey,
+    img_dir: Path,
+    anno_json: Path,
+    args: argparse.Namespace,
+    artifact_info: ArtifactInfo,
+) -> Optional[Dict[str, Any]]:
+    path = metrics_json_path(args, key)
+    if not path.exists() or not args.reuse_accuracy_cache:
+        return None
+    try:
+        with path.open("r") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return None
+
+    expected = eval_signature(key, img_dir, anno_json, args, artifact_info)
+    for name, value in expected.items():
+        if payload.get(name) != value:
+            return None
+    return payload
+
+
+def save_cached_metrics(
+    key: ArtifactKey,
+    img_dir: Path,
+    anno_json: Path,
+    args: argparse.Namespace,
+    artifact_info: ArtifactInfo,
+    eval_result: EvalResult,
+) -> None:
+    payload = eval_signature(key, img_dir, anno_json, args, artifact_info)
+    payload.update(
+        {
+            "ap50_95": float(eval_result.ap50_95),
+            "num_images": int(eval_result.num_images),
+            "mean_inf_ms": float(eval_result.mean_inf_ms),
+            "wall_time_s": float(eval_result.wall_time_s),
+            "pred_json_path": str(eval_result.pred_json_path),
+            "created_at_unix": float(time.time()),
+        }
+    )
+    path = metrics_json_path(args, key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+
+
+def run_speed_pass(
+    prepared: PreparedBackend,
+    dataset_bundle: DatasetBundle,
+    args: argparse.Namespace,
+    description: str,
+) -> PassResult:
+    inf_total = 0.0
+    num_images = 0
+    wall_start = time.perf_counter()
+
+    iterator = dataset_bundle.dataloader
+    progress = None
+    if args.progress:
+        progress = tqdm(iterator, desc=description, unit="img")
+        iterator = progress
+
+    try:
+        for image_ids, batch_images, _ in iterator:
+            _, inf_ms = prepared.infer(batch_images)
+            num_images += len(image_ids)
+            inf_total += float(inf_ms)
+            if progress is not None:
+                progress.set_postfix(
+                    inf="%.2fms" % (inf_total / float(max(1, num_images)))
+                )
+    finally:
+        if progress is not None:
+            progress.close()
+
+    wall_time_s = time.perf_counter() - wall_start
+    mean_inf_ms = inf_total / float(max(1, num_images))
+    return PassResult(
+        mean_inf_ms=mean_inf_ms, wall_time_s=wall_time_s, num_images=num_images
+    )
+
+
+def run_eval_pass(
+    prepared: PreparedBackend,
+    dataset_bundle: DatasetBundle,
+    label_to_catid: Dict[int, int],
+    anno_json: Path,
+    args: argparse.Namespace,
+    description: str,
+) -> EvalResult:
+    all_predictions: List[Dict[str, Any]] = []
+    inf_total = 0.0
+    num_images = 0
+    wall_start = time.perf_counter()
+
+    iterator = dataset_bundle.dataloader
+    progress = None
+    if args.progress:
+        progress = tqdm(iterator, desc=description, unit="img")
+        iterator = progress
+
+    try:
+        for image_ids, batch_images, metas in iterator:
+            outputs, inf_ms = prepared.infer(batch_images)
+            num_images += len(image_ids)
+            inf_total += float(inf_ms)
+            all_predictions.extend(
+                fixed_outputs_to_coco_json(
+                    outputs=outputs,
+                    image_ids=image_ids,
+                    metas=metas,
+                    label_to_catid=label_to_catid,
+                    score_thr=float(args.score_thr),
+                    max_det=int(args.max_det),
+                )
+            )
+            if progress is not None:
+                progress.set_postfix(
+                    inf="%.2fms" % (inf_total / float(max(1, num_images)))
+                )
+    finally:
+        if progress is not None:
+            progress.close()
+
+    pred_json = predictions_json_path(args, prepared.key)
+    pred_json.parent.mkdir(parents=True, exist_ok=True)
+    with pred_json.open("w") as handle:
+        json.dump(all_predictions, handle)
+
+    stats = coco_map_via_ultralytics(
+        dataloader=dataset_bundle.dataloader,
+        save_dir=prepared.artifact_info.artifact_dir,
+        pred_json=pred_json,
+        anno_json=anno_json,
+        jdict=all_predictions,
+    )
+    ap50_95 = float(stats.get(METRIC_KEY, float("nan")))
+
+    wall_time_s = time.perf_counter() - wall_start
+    mean_inf_ms = inf_total / float(max(1, num_images))
+    return EvalResult(
+        mean_inf_ms=mean_inf_ms,
+        wall_time_s=wall_time_s,
+        num_images=num_images,
+        ap50_95=ap50_95,
+        pred_json_path=str(pred_json),
+    )
+
+
+def build_error_row(
+    key: ArtifactKey,
+    args: argparse.Namespace,
+    repeat: int,
+    weights_desc: str,
+    save_dir: Path,
+    artifact_path: str,
+    artifact_size_mb: Optional[float],
+    error: str,
+) -> Dict[str, Any]:
+    precision = precision_name(key.half)
+    format_name = FORMAT_TO_NAME[key.format_key]
     return {
         "framework": "torchvision",
-        "model": spec.model,
-        "weights": "",
-        "imgsz": spec.imgsz,
-        "batch": args.batch,
+        "model": key.model,
+        "weights": weights_desc,
+        "imgsz": int(key.imgsz),
+        "batch": int(args.batch),
         "device": str(args.device),
-        "repeat": spec.repeat,
-        "half": int(spec.half),
+        "repeat": int(repeat),
+        "half": int(key.half),
         "precision": precision,
         "format_name": format_name,
-        "format_arg": FORMAT_TO_ARG[spec.format_key],
+        "format_arg": FORMAT_TO_ARG[key.format_key],
         "backend": format_name.lower(),
         "runtime_provider": "",
-        "benchmark_impl": "torchvision_custom_benchmark_v2",
+        "benchmark_impl": "torchvision_cached_benchmark_v3",
         "input_geometry": "external_letterbox_square",
         "resize_mode": "letterbox",
         "conf": float(args.score_thr),
@@ -1191,336 +1879,457 @@ def build_error_row(
         "fps": "",
         "status": "error",
         "error": error,
-        "artifact_path": "",
-        "artifact_size_mb": "",
-        "save_dir": save_dir,
-        "run_name": run_name,
+        "artifact_path": artifact_path,
+        "artifact_size_mb": artifact_size_mb if artifact_size_mb is not None else "",
+        "save_dir": str(save_dir),
+        "run_name": run_name_for(key, repeat),
         "metric_key": METRIC_KEY,
         "benchmark_wall_time_s": "",
     }
 
 
-def run_one(
-    spec: RunSpec, img_dir: Path, anno_json: Path, args: argparse.Namespace
+def build_result_row(
+    key: ArtifactKey,
+    args: argparse.Namespace,
+    repeat: int,
+    artifact_info: ArtifactInfo,
+    prepared: PreparedBackend,
+    pass_result: PassResult,
+    ap50_95: float,
 ) -> Dict[str, Any]:
-    if int(args.batch) != 1:
-        return build_error_row(
-            spec, args, "This script keeps batch=1 to match Ultralytics benchmark mode."
-        )
-
-    device = pick_device(args.device)
-    if spec.half and device.type != "cuda":
-        return build_error_row(
-            spec,
-            args,
-            "FP16 benchmarking is only enabled for CUDA devices in this script.",
-        )
-    if spec.format_key == "trt" and device.type != "cuda":
-        return build_error_row(
-            spec, args, "TensorRT benchmarking requires a CUDA device."
-        )
-
-    precision = "fp16" if spec.half else "fp32"
-    run_name = "torchvision_{model}_img{imgsz}_{fmt}_{prec}_r{repeat}".format(
-        model=spec.model,
-        imgsz=spec.imgsz,
-        fmt=spec.format_key,
-        prec=precision,
-        repeat=spec.repeat,
-    )
-    save_dir = Path(args.project).expanduser().resolve() / run_name
-    if save_dir.exists() and not bool(args.exist_ok):
-        return build_error_row(
-            spec,
-            args,
-            "Run directory already exists and --no-exist-ok was used: %s" % save_dir,
-        )
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    wall_start = time.perf_counter()
-
-    try:
-        model, weights = build_model(
-            spec.model,
-            device=device,
-            score_thr=float(args.score_thr),
-            max_det=int(args.max_det),
-            imgsz=int(spec.imgsz),
-            half=bool(spec.half),
-        )
-    except Exception as exc:
-        return build_error_row(
-            spec, args, "Failed to build torchvision model: %s" % exc
-        )
-
-    try:
-        dataset = CocoLetterboxDataset(
-            img_dir=img_dir, anno_json=anno_json, imgsz=int(spec.imgsz)
-        )
-        if int(args.limit) > 0:
-            dataset.img_ids = dataset.img_ids[: int(args.limit)]
-            dataset.im_files = dataset.im_files[: int(args.limit)]
-        dataloader = DataLoader(
-            dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=int(args.workers),
-            pin_memory=(device.type == "cuda"),
-            collate_fn=collate_fn,
-        )
-    except Exception as exc:
-        return build_error_row(spec, args, "Failed to build dataloader: %s" % exc)
-
-    try:
-        label_to_catid = build_label_to_coco_catid(weights, dataset.coco)
-    except Exception as exc:
-        return build_error_row(spec, args, "Failed to build label mapping: %s" % exc)
-
-    wrapper = TVDetExportWrapper(model, int(args.max_det)).eval().to(device)
-    dummy_dtype = torch.float16 if spec.half else torch.float32
-    dummy_input = torch.zeros(
-        (1, 3, int(spec.imgsz), int(spec.imgsz)), device=device, dtype=dummy_dtype
-    )
-
-    artifact_path = ""
-    runtime_provider = str(device)
-    backend = "pytorch_eager"
-    onnx_opset = (
-        int(args.onnx_opset)
-        if int(args.onnx_opset) > 0
-        else infer_best_onnx_opset(device.type == "cuda")
-    )
-
-    try:
-        if spec.format_key == "pytorch":
-            warmup_torch_module(
-                wrapper, device, int(spec.imgsz), bool(spec.half), int(args.warmup)
-            )
-
-            def infer(
-                batch_images: torch.Tensor,
-            ) -> Tuple[
-                Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], float
-            ]:
-                return run_torch_module(wrapper, batch_images, device, bool(spec.half))
-
-            backend = "pytorch_eager"
-            runtime_provider = str(device)
-
-        elif spec.format_key == "torchscript":
-            artifact = save_dir / (spec.model + "_img%d.torchscript" % int(spec.imgsz))
-            script_module = export_torchscript(wrapper, dummy_input, artifact, device)
-            artifact_path = str(artifact)
-            warmup_torch_module(
-                script_module,
-                device,
-                int(spec.imgsz),
-                bool(spec.half),
-                int(args.warmup),
-            )
-
-            def infer(
-                batch_images: torch.Tensor,
-            ) -> Tuple[
-                Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], float
-            ]:
-                return run_torch_module(
-                    script_module, batch_images, device, bool(spec.half)
-                )
-
-            backend = "torchscript"
-            runtime_provider = str(device)
-
-        elif spec.format_key == "onnx":
-            artifact = save_dir / (spec.model + "_img%d.onnx" % int(spec.imgsz))
-            export_onnx(wrapper, dummy_input, artifact, onnx_opset)
-            artifact_path = str(artifact)
-            onnx_runner = OnnxRuntimeRunner(
-                artifact, device, int(spec.imgsz), int(args.max_det), bool(spec.half)
-            )
-            runtime_provider = onnx_runner.provider
-            if spec.half and runtime_provider != "CUDAExecutionProvider":
-                return build_error_row(
-                    spec,
-                    args,
-                    "FP16 ONNX benchmark requires ONNX Runtime CUDAExecutionProvider; got '%s'."
-                    % runtime_provider,
-                )
-            onnx_runner.warmup(int(args.warmup))
-
-            def infer(
-                batch_images: torch.Tensor,
-            ) -> Tuple[
-                Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], float
-            ]:
-                return onnx_runner.run(batch_images)
-
-            backend = "onnxruntime"
-
-        elif spec.format_key == "trt":
-            onnx_artifact = save_dir / (spec.model + "_img%d.onnx" % int(spec.imgsz))
-            engine_artifact = save_dir / (
-                spec.model + "_img%d.engine" % int(spec.imgsz)
-            )
-            export_onnx(wrapper, dummy_input, onnx_artifact, onnx_opset)
-            build_tensorrt_engine(onnx_artifact, engine_artifact, bool(spec.half))
-            artifact_path = str(engine_artifact)
-            trt_runner = TensorRTRunner(engine_artifact, device, int(spec.imgsz))
-            trt_runner.warmup(int(args.warmup))
-
-            def infer(
-                batch_images: torch.Tensor,
-            ) -> Tuple[
-                Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], float
-            ]:
-                return trt_runner.run(batch_images)
-
-            backend = "tensorrt"
-            runtime_provider = "tensorrt"
-
-        else:
-            return build_error_row(
-                spec, args, "Unsupported format key: %s" % spec.format_key
-            )
-
-    except Exception as exc:
-        return build_error_row(spec, args, "Backend setup/export failed: %s" % exc)
-
-    all_predictions = []  # type: List[Dict[str, Any]]
-    inference_ms_total = 0.0
-    num_images = 0
-
-    progress = tqdm(dataloader, desc=run_name, unit="img")
-    try:
-        for image_ids, batch_images, metas in progress:
-            outputs, inf_ms = infer(batch_images)
-            num_images += len(image_ids)
-            inference_ms_total += float(inf_ms)
-            all_predictions.extend(
-                fixed_outputs_to_coco_json(
-                    outputs=outputs,
-                    image_ids=image_ids,
-                    metas=metas,
-                    label_to_catid=label_to_catid,
-                    score_thr=float(args.score_thr),
-                    max_det=int(args.max_det),
-                )
-            )
-            progress.set_postfix(
-                inf="%.2fms" % (inference_ms_total / float(max(1, num_images)))
-            )
-    except Exception as exc:
-        return build_error_row(spec, args, "Inference loop failed: %s" % exc)
-    finally:
-        progress.close()
-
-    pred_json = save_dir / "predictions.json"
-    try:
-        with pred_json.open("w") as handle:
-            json.dump(all_predictions, handle)
-    except Exception as exc:
-        return build_error_row(spec, args, "Failed to write predictions JSON: %s" % exc)
-
-    try:
-        stats = coco_map_via_ultralytics(
-            dataloader=dataloader,
-            save_dir=save_dir,
-            pred_json=pred_json,
-            anno_json=anno_json,
-            jdict=all_predictions,
-        )
-        ap50_95 = float(stats.get(METRIC_KEY, float("nan")))
-        status = "success"
-        error = ""
-    except Exception as exc:
-        ap50_95 = float("nan")
-        status = "error"
-        error = "COCO evaluation failed: %s" % exc
-
-    wall_time_s = time.perf_counter() - wall_start
-    mean_inf_ms = inference_ms_total / float(max(1, num_images))
-    fps = None if mean_inf_ms <= 0 else (1000.0 / mean_inf_ms)
-
-    row = {
+    fps = None if pass_result.mean_inf_ms <= 0 else (1000.0 / pass_result.mean_inf_ms)
+    return {
         "framework": "torchvision",
-        "model": spec.model,
-        "weights": weights_descriptor(weights),
-        "imgsz": int(spec.imgsz),
-        "batch": 1,
+        "model": key.model,
+        "weights": artifact_info.weights_desc,
+        "imgsz": int(key.imgsz),
+        "batch": int(args.batch),
         "device": str(args.device),
-        "repeat": int(spec.repeat),
-        "half": int(spec.half),
-        "precision": precision,
-        "format_name": FORMAT_TO_NAME[spec.format_key],
-        "format_arg": FORMAT_TO_ARG[spec.format_key],
-        "backend": backend,
-        "runtime_provider": runtime_provider,
-        "benchmark_impl": "torchvision_custom_benchmark_v2",
+        "repeat": int(repeat),
+        "half": int(key.half),
+        "precision": precision_name(key.half),
+        "format_name": FORMAT_TO_NAME[key.format_key],
+        "format_arg": FORMAT_TO_ARG[key.format_key],
+        "backend": prepared.backend,
+        "runtime_provider": prepared.runtime_provider,
+        "benchmark_impl": prepared.benchmark_impl,
         "input_geometry": "external_letterbox_square",
         "resize_mode": "letterbox",
         "conf": float(args.score_thr),
         "max_det": int(args.max_det),
         "speed_preprocess_ms": "",
-        "speed_inference_ms": mean_inf_ms,
+        "speed_inference_ms": float(pass_result.mean_inf_ms),
         "speed_postprocess_ms": "",
-        "ap50_95": ap50_95,
+        "ap50_95": float(ap50_95),
         "fps": fps,
-        "status": status,
-        "error": error,
-        "artifact_path": artifact_path,
-        "artifact_size_mb": file_size_mb(artifact_path),
-        "save_dir": str(save_dir),
-        "run_name": run_name,
+        "status": "success",
+        "error": "",
+        "artifact_path": artifact_info.artifact_path,
+        "artifact_size_mb": (
+            artifact_info.artifact_size_mb
+            if artifact_info.artifact_size_mb is not None
+            else ""
+        ),
+        "save_dir": str(artifact_info.artifact_dir),
+        "run_name": run_name_for(key, repeat),
         "metric_key": METRIC_KEY,
-        "benchmark_wall_time_s": wall_time_s,
+        "benchmark_wall_time_s": float(pass_result.wall_time_s),
     }
-    return row
+
+
+def clear_cuda_if_needed(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def all_repeats_already_done(
+    framework: str,
+    key: ArtifactKey,
+    args: argparse.Namespace,
+    existing_success: Set[RowKey],
+) -> bool:
+    if not args.skip_existing:
+        return False
+    for repeat in range(1, int(args.repeats) + 1):
+        if spec_row_key(framework, key, args, repeat) not in existing_success:
+            return False
+    return True
 
 
 def main() -> None:
     args = parse_args()
-    img_dir, anno_json = resolve_coco_from_ultralytics_yaml(args.data)
+
+    if int(args.batch) != 1:
+        raise SystemExit(
+            "This script keeps batch=1 to match the original benchmark intent."
+        )
+    if args.mode != "prepare":
+        img_dir, anno_json = resolve_coco_from_ultralytics_yaml(args.data)
+    else:
+        img_dir, anno_json = (Path("."), Path("."))
+
+    device = pick_device(args.device)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     precisions = [False]
     if args.include_half:
         precisions.append(True)
 
+    existing_success = (
+        load_existing_success_keys(args.out_csv) if args.skip_existing else set()
+    )
     rows_written = 0
-    for model_name in args.models:
-        for imgsz in args.imgsz:
-            for format_key in args.formats:
-                for half in precisions:
-                    for repeat in range(1, int(args.repeats) + 1):
-                        spec = RunSpec(
+
+    for imgsz in args.imgsz:
+        dataset_bundle: Optional[DatasetBundle] = None
+        if args.mode != "prepare":
+            dataset_bundle = build_dataset_bundle(
+                int(imgsz), img_dir, anno_json, args, device
+            )
+
+        for model_name in args.models:
+            for half in precisions:
+                key_base = ArtifactKey(
+                    model=str(model_name),
+                    imgsz=int(imgsz),
+                    format_key="pytorch",
+                    half=bool(half),
+                )
+                weights_desc = weights_descriptor(get_weights_default(model_name))
+
+                if half and device.type != "cuda":
+                    for format_key in args.formats:
+                        key = ArtifactKey(
                             model=str(model_name),
                             imgsz=int(imgsz),
                             format_key=str(format_key),
                             half=bool(half),
-                            repeat=int(repeat),
                         )
-                        row = run_one(spec, img_dir, anno_json, args)
+                        for repeat in range(1, int(args.repeats) + 1):
+                            if args.mode == "prepare" and key.format_key == "pytorch":
+                                continue
+                            row = build_error_row(
+                                key=key,
+                                args=args,
+                                repeat=repeat,
+                                weights_desc=weights_desc,
+                                save_dir=artifact_base_dir(args, key),
+                                artifact_path=str(artifact_file_path(args, key) or ""),
+                                artifact_size_mb=file_size_mb(
+                                    str(artifact_file_path(args, key) or "")
+                                ),
+                                error="FP16 benchmarking/export is only enabled for CUDA devices in this script.",
+                            )
+                            if args.mode != "prepare":
+                                write_csv([row], args.out_csv)
+                                rows_written += 1
+                    continue
+
+                label_to_catid: Optional[Dict[int, int]] = None
+                if dataset_bundle is not None:
+                    label_to_catid = build_label_to_coco_catid(
+                        get_weights_default(model_name), dataset_bundle.dataset.coco
+                    )
+
+                base_bundle: Optional[BaseModelBundle] = None
+
+                def ensure_base_bundle() -> BaseModelBundle:
+                    nonlocal base_bundle, weights_desc
+                    if base_bundle is None:
+                        base_bundle = build_base_model_bundle(
+                            ArtifactKey(
+                                model=str(model_name),
+                                imgsz=int(imgsz),
+                                format_key="pytorch",
+                                half=bool(half),
+                            ),
+                            args,
+                            device,
+                        )
+                        weights_desc = base_bundle.weights_desc
+                    return base_bundle
+
+                for format_key in args.formats:
+                    key = ArtifactKey(
+                        model=str(model_name),
+                        imgsz=int(imgsz),
+                        format_key=str(format_key),
+                        half=bool(half),
+                    )
+
+                    if args.mode != "prepare" and all_repeats_already_done(
+                        "torchvision", key, args, existing_success
+                    ):
                         print(
-                            "[{framework}] {model:>28} imgsz={imgsz:>4} fmt={fmt:>11} prec={prec:>4} run={run:>2} | "
-                            "status={status:>8} inf={inf}ms AP50-95={ap}".format(
-                                framework=row["framework"],
-                                model=row["model"],
-                                imgsz=row["imgsz"],
-                                fmt=row["format_name"],
-                                prec=row["precision"],
-                                run=row["repeat"],
-                                status=row["status"],
-                                inf=printable(row.get("speed_inference_ms")),
-                                ap=printable(row.get("ap50_95")),
+                            "[SKIP] torchvision %s imgsz=%s fmt=%s prec=%s | all repeats already succeeded in %s"
+                            % (
+                                key.model,
+                                key.imgsz,
+                                key.format_key,
+                                precision_name(key.half),
+                                args.out_csv.expanduser().resolve(),
                             )
                         )
-                        if row.get("error"):
-                            print("  -> %s" % row["error"])
-                        write_csv([row], args.out_csv)
-                        rows_written += 1
+                        continue
 
-    print(
-        "\nSaved %d rows to: %s" % (rows_written, args.out_csv.expanduser().resolve())
-    )
+                    try:
+                        need_base_for_prepare = (
+                            key.format_key == "pytorch"
+                            or args.mode in ("prepare", "full")
+                            and (
+                                key.format_key == "pytorch"
+                                or args.rebuild_artifacts
+                                or (
+                                    artifact_file_path(args, key) is not None
+                                    and not Path(artifact_file_path(args, key)).exists()  # type: ignore[arg-type]
+                                )
+                                or (
+                                    key.format_key == "trt"
+                                    and (
+                                        args.rebuild_artifacts
+                                        or not canonical_onnx_path(args, key).exists()
+                                    )
+                                )
+                            )
+                        )
+                        bundle_for_prepare = (
+                            ensure_base_bundle() if need_base_for_prepare else None
+                        )
+
+                        if args.mode == "benchmark":
+                            if key.format_key != "pytorch":
+                                path_obj = artifact_file_path(args, key)
+                                if path_obj is None or not path_obj.exists():
+                                    raise FileNotFoundError(
+                                        "Missing prepared artifact for benchmark mode: %s"
+                                        % (path_obj or "<none>")
+                                    )
+                            artifact_info = ensure_artifact(
+                                key,
+                                args,
+                                device,
+                                (
+                                    bundle_for_prepare
+                                    if key.format_key == "pytorch"
+                                    else None
+                                ),
+                            )
+                        else:
+                            artifact_info = ensure_artifact(
+                                key, args, device, bundle_for_prepare
+                            )
+
+                        if args.mode == "prepare":
+                            print(
+                                "[PREPARED] torchvision %s imgsz=%s fmt=%s prec=%s -> %s"
+                                % (
+                                    key.model,
+                                    key.imgsz,
+                                    key.format_key,
+                                    precision_name(key.half),
+                                    artifact_info.artifact_path
+                                    or str(artifact_info.artifact_dir),
+                                )
+                            )
+                            continue
+
+                        if key.format_key == "pytorch" and base_bundle is None:
+                            ensure_base_bundle()
+
+                        prepared = load_backend(
+                            key, args, device, artifact_info, base_bundle
+                        )
+                        assert dataset_bundle is not None
+                        assert label_to_catid is not None
+
+                        fresh_eval_result: Optional[EvalResult] = None
+                        cached_metrics = None
+                        if args.eval_policy == "once":
+                            cached_metrics = load_cached_metrics(
+                                key, img_dir, anno_json, args, artifact_info
+                            )
+                            if cached_metrics is None:
+                                fresh_eval_result = run_eval_pass(
+                                    prepared,
+                                    dataset_bundle,
+                                    label_to_catid,
+                                    anno_json,
+                                    args,
+                                    description="eval:%s/%s/%s/%s"
+                                    % (
+                                        key.model,
+                                        key.imgsz,
+                                        key.format_key,
+                                        precision_name(key.half),
+                                    ),
+                                )
+                                save_cached_metrics(
+                                    key,
+                                    img_dir,
+                                    anno_json,
+                                    args,
+                                    artifact_info,
+                                    fresh_eval_result,
+                                )
+                                ap50_95 = float(fresh_eval_result.ap50_95)
+                            else:
+                                ap50_95 = float(cached_metrics["ap50_95"])
+                        else:
+                            ap50_95 = float("nan")
+
+                        for repeat in range(1, int(args.repeats) + 1):
+                            row_key = spec_row_key("torchvision", key, args, repeat)
+                            if args.skip_existing and row_key in existing_success:
+                                continue
+
+                            try:
+                                if args.eval_policy == "every-repeat":
+                                    eval_result = run_eval_pass(
+                                        prepared,
+                                        dataset_bundle,
+                                        label_to_catid,
+                                        anno_json,
+                                        args,
+                                        description="eval:%s/%s/%s/%s/r%s"
+                                        % (
+                                            key.model,
+                                            key.imgsz,
+                                            key.format_key,
+                                            precision_name(key.half),
+                                            repeat,
+                                        ),
+                                    )
+                                    pass_result = PassResult(
+                                        mean_inf_ms=eval_result.mean_inf_ms,
+                                        wall_time_s=eval_result.wall_time_s,
+                                        num_images=eval_result.num_images,
+                                    )
+                                    ap50_95 = float(eval_result.ap50_95)
+                                elif (
+                                    args.eval_policy == "once"
+                                    and repeat == 1
+                                    and fresh_eval_result is not None
+                                    and args.reuse_eval_as_first_repeat
+                                ):
+                                    pass_result = PassResult(
+                                        mean_inf_ms=fresh_eval_result.mean_inf_ms,
+                                        wall_time_s=fresh_eval_result.wall_time_s,
+                                        num_images=fresh_eval_result.num_images,
+                                    )
+                                else:
+                                    pass_result = run_speed_pass(
+                                        prepared,
+                                        dataset_bundle,
+                                        args,
+                                        description="speed:%s/%s/%s/%s/r%s"
+                                        % (
+                                            key.model,
+                                            key.imgsz,
+                                            key.format_key,
+                                            precision_name(key.half),
+                                            repeat,
+                                        ),
+                                    )
+
+                                row = build_result_row(
+                                    key=key,
+                                    args=args,
+                                    repeat=repeat,
+                                    artifact_info=artifact_info,
+                                    prepared=prepared,
+                                    pass_result=pass_result,
+                                    ap50_95=ap50_95,
+                                )
+                            except Exception as exc:
+                                row = build_error_row(
+                                    key=key,
+                                    args=args,
+                                    repeat=repeat,
+                                    weights_desc=artifact_info.weights_desc,
+                                    save_dir=artifact_info.artifact_dir,
+                                    artifact_path=artifact_info.artifact_path,
+                                    artifact_size_mb=artifact_info.artifact_size_mb,
+                                    error=str(exc),
+                                )
+
+                            print(
+                                "[torchvision] {model:>28} imgsz={imgsz:>4} fmt={fmt:>11} prec={prec:>4} run={run:>2} | "
+                                "status={status:>8} inf={inf}ms AP50-95={ap}".format(
+                                    model=row["model"],
+                                    imgsz=row["imgsz"],
+                                    fmt=row["format_name"],
+                                    prec=row["precision"],
+                                    run=row["repeat"],
+                                    status=row["status"],
+                                    inf=printable(
+                                        parse_float(row.get("speed_inference_ms"))
+                                    ),
+                                    ap=printable(parse_float(row.get("ap50_95"))),
+                                )
+                            )
+                            if row.get("error"):
+                                print("  -> %s" % row["error"])
+                            write_csv([row], args.out_csv)
+                            rows_written += 1
+                            if row.get("status") == "success":
+                                existing_success.add(row_key)
+
+                    except Exception as exc:
+                        pending_repeats = range(1, int(args.repeats) + 1)
+                        if args.mode == "prepare":
+                            pending_repeats = [1]
+                        for repeat in pending_repeats:
+                            if args.mode != "prepare":
+                                row_key = spec_row_key("torchvision", key, args, repeat)
+                                if args.skip_existing and row_key in existing_success:
+                                    continue
+                            row = build_error_row(
+                                key=key,
+                                args=args,
+                                repeat=int(repeat),
+                                weights_desc=weights_desc,
+                                save_dir=artifact_base_dir(args, key),
+                                artifact_path=str(artifact_file_path(args, key) or ""),
+                                artifact_size_mb=file_size_mb(
+                                    str(artifact_file_path(args, key) or "")
+                                ),
+                                error=str(exc),
+                            )
+                            print(
+                                "[torchvision] {model:>28} imgsz={imgsz:>4} fmt={fmt:>11} prec={prec:>4} run={run:>2} | "
+                                "status={status:>8}".format(
+                                    model=row["model"],
+                                    imgsz=row["imgsz"],
+                                    fmt=row["format_name"],
+                                    prec=row["precision"],
+                                    run=row["repeat"],
+                                    status=row["status"],
+                                )
+                            )
+                            print("  -> %s" % row["error"])
+                            if args.mode != "prepare":
+                                write_csv([row], args.out_csv)
+                                rows_written += 1
+
+                    finally:
+                        clear_cuda_if_needed(device)
+
+                base_bundle = None
+                clear_cuda_if_needed(device)
+
+        dataset_bundle = None
+        clear_cuda_if_needed(device)
+
+    if args.mode == "prepare":
+        print(
+            "\nPrepared artifacts under: %s" % args.artifact_root.expanduser().resolve()
+        )
+    else:
+        print(
+            "\nSaved %d rows to: %s"
+            % (rows_written, args.out_csv.expanduser().resolve())
+        )
 
 
 if __name__ == "__main__":

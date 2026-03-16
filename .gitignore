@@ -12,8 +12,10 @@ outputs/
 *.pt
 *.pth
 *.onnx
+*.torchscript
 runs/
 weights/
+*_cache_*/
 
 # Notebooks
 .ipynb_checkpoints/
