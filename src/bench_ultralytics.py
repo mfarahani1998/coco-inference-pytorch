@@ -29,6 +29,7 @@ import os
 import platform
 import shutil
 import time
+from copy import deepcopy
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
@@ -88,6 +89,8 @@ FIELDNAMES = [
     "resize_mode",
     "conf",
     "max_det",
+    "params",
+    "gflops",
     "speed_preprocess_ms",
     "speed_inference_ms",
     "speed_postprocess_ms",
@@ -104,7 +107,9 @@ FIELDNAMES = [
 ]
 METRIC_KEY = "metrics/mAP50-95(B)"
 ARTIFACT_SCHEMA_VERSION = 2
-BENCHMARK_IMPL = "ultralytics_round_robin_artifacts_v5_cleanup"
+BENCHMARK_IMPL = "ultralytics_round_robin_artifacts_v6_model_stats"
+MODEL_STATS_SCHEMA_VERSION = 1
+MODEL_STATS_IMPL = "ultralytics_fused_pytorch_model_stats_v1"
 IMAGE_SUFFIXES = {
     ".bmp",
     ".dng",
@@ -159,6 +164,13 @@ class MetricLookupKey:
     max_det: int
 
 
+@dataclass(frozen=True)
+class ModelStatsKey:
+    model: str
+    weights: str
+    imgsz: int
+
+
 @dataclass
 class ArtifactInfo:
     key: ArtifactKey
@@ -194,6 +206,12 @@ class SourceBundle:
 class MetricCacheEntry:
     ap50_95: float
     metric_key: str
+
+
+@dataclass
+class ModelStatsEntry:
+    params: Optional[int]
+    gflops: Optional[float]
 
 
 @lru_cache(maxsize=1)
@@ -454,6 +472,36 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--no-reuse-accuracy-cache", dest="reuse_accuracy_cache", action="store_false"
+    )
+    parser.add_argument(
+        "--measure-model-stats",
+        dest="measure_model_stats",
+        action="store_true",
+        default=True,
+        help=(
+            "Measure fused-model parameter counts and GFLOPs once per model/image size and "
+            "reuse them across PyTorch, TorchScript, ONNX, TensorRT, FP32, and FP16 rows."
+        ),
+    )
+    parser.add_argument(
+        "--no-measure-model-stats",
+        dest="measure_model_stats",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--reuse-model-stats-cache",
+        dest="reuse_model_stats_cache",
+        action="store_true",
+        default=True,
+        help=(
+            "Reuse model_stats.json when the weights signature and image size still match. "
+            "This avoids re-measuring params/GFLOPs on resumed runs and prepared artifacts."
+        ),
+    )
+    parser.add_argument(
+        "--no-reuse-model-stats-cache",
+        dest="reuse_model_stats_cache",
+        action="store_false",
     )
     parser.add_argument(
         "--resume",
@@ -838,11 +886,30 @@ def ensure_csv_schema(out_csv: Path) -> None:
         return
     try:
         with out_csv.open("r", newline="") as handle:
-            first_line = handle.readline().strip("\n\r")
+            reader = csv.DictReader(handle)
+            current_header = reader.fieldnames or []
+            rows = list(reader)
     except Exception:
         return
-    current_header = first_line.split(",") if first_line else []
     if current_header == FIELDNAMES:
+        return
+    if set(current_header).issubset(set(FIELDNAMES)):
+        upgraded_rows = [
+            {field: row.get(field, "") for field in FIELDNAMES} for row in rows
+        ]
+        temp_path = out_csv.with_name(
+            out_csv.stem + ".schema_upgrade_" + str(int(time.time())) + out_csv.suffix
+        )
+        with temp_path.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=FIELDNAMES)
+            writer.writeheader()
+            for row in upgraded_rows:
+                writer.writerow(row)
+        temp_path.replace(out_csv)
+        print(
+            "[INFO] Existing CSV header was upgraded in-place to the current schema: %s"
+            % out_csv
+        )
         return
     backup = out_csv.with_name(
         out_csv.stem + ".legacy_" + str(int(time.time())) + out_csv.suffix
@@ -946,6 +1013,278 @@ def load_existing_metric_rows(out_csv: Path) -> Dict[MetricLookupKey, MetricCach
     except Exception:
         return {}
     return cached
+
+
+def model_stats_key_from_row(row: Dict[str, Any]) -> Optional[ModelStatsKey]:
+    try:
+        return ModelStatsKey(
+            model=safe_str(row.get("model")),
+            weights=safe_str(row.get("weights")),
+            imgsz=int(float(safe_str(row.get("imgsz")))),
+        )
+    except Exception:
+        return None
+
+
+def load_existing_model_stats_rows(
+    out_csv: Path,
+) -> Dict[ModelStatsKey, ModelStatsEntry]:
+    cached: Dict[ModelStatsKey, ModelStatsEntry] = {}
+    if not out_csv.exists():
+        return cached
+    try:
+        with out_csv.open("r", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                key = model_stats_key_from_row(row)
+                if key is None:
+                    continue
+                params = parse_float(row.get("params"))
+                gflops = parse_float(row.get("gflops"))
+                if params is None and gflops is None:
+                    continue
+                cached[key] = ModelStatsEntry(
+                    params=(int(params) if params is not None else None),
+                    gflops=(float(gflops) if gflops is not None else None),
+                )
+    except Exception:
+        return {}
+    return cached
+
+
+def model_stats_lookup_key(
+    key: ArtifactKey,
+    weights_ref: str,
+) -> ModelStatsKey:
+    return ModelStatsKey(
+        model=key.model,
+        weights=weights_ref,
+        imgsz=int(key.imgsz),
+    )
+
+
+def model_stats_json_path(args: argparse.Namespace, key: ModelStatsKey) -> Path:
+    return (
+        args.artifact_root / key.model / ("img%d" % int(key.imgsz)) / "model_stats.json"
+    )
+
+
+def build_model_stats_payload(
+    key: ModelStatsKey,
+    params: Optional[int],
+    gflops: Optional[float],
+) -> Dict[str, Any]:
+    return {
+        "schema_version": MODEL_STATS_SCHEMA_VERSION,
+        "stats_impl": MODEL_STATS_IMPL,
+        "model": key.model,
+        "imgsz": int(key.imgsz),
+        "weights_signature": weights_signature(key.weights),
+        "params": int(params) if params is not None else None,
+        "gflops": float(gflops) if gflops is not None else None,
+        "shared_across_formats": True,
+        "shared_across_precisions": True,
+        "batch": 1,
+        "ultralytics_version": try_ultralytics_version(),
+    }
+
+
+def model_stats_payload_matches(
+    payload: Optional[Dict[str, Any]],
+    key: ModelStatsKey,
+) -> bool:
+    if payload is None:
+        return False
+    return (
+        _int_or_none(payload.get("schema_version")) == MODEL_STATS_SCHEMA_VERSION
+        and payload.get("stats_impl") == MODEL_STATS_IMPL
+        and payload.get("model") == key.model
+        and _int_or_none(payload.get("imgsz")) == int(key.imgsz)
+        and weights_signature_matches(payload.get("weights_signature"), key.weights)
+    )
+
+
+def load_cached_model_stats(
+    args: argparse.Namespace,
+    key: ModelStatsKey,
+) -> Optional[ModelStatsEntry]:
+    if not args.reuse_model_stats_cache:
+        return None
+    payload = load_json(model_stats_json_path(args, key))
+    if not model_stats_payload_matches(payload, key):
+        return None
+    params = payload.get("params")  # type: ignore
+    gflops = payload.get("gflops")  # type: ignore
+    if params is None and gflops is None:
+        return None
+    return ModelStatsEntry(
+        params=(int(params) if params is not None else None),
+        gflops=(float(gflops) if gflops is not None else None),
+    )
+
+
+def save_cached_model_stats(
+    args: argparse.Namespace,
+    key: ModelStatsKey,
+    entry: ModelStatsEntry,
+) -> None:
+    save_json(
+        model_stats_json_path(args, key),
+        build_model_stats_payload(
+            key=key,
+            params=entry.params,
+            gflops=entry.gflops,
+        ),
+    )
+
+
+def model_stats_entry_complete(entry: Optional[ModelStatsEntry]) -> bool:
+    return bool(
+        entry is not None and entry.params is not None and entry.gflops is not None
+    )
+
+
+def ensure_model_stats_imports() -> Tuple[Any, Any, Optional[Any]]:
+    try:
+        from ultralytics.utils.torch_utils import get_flops, get_num_params
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to import ultralytics.utils.torch_utils model stat helpers: %s"
+            % exc
+        )
+    try:
+        from ultralytics.utils.torch_utils import get_flops_with_torch_profiler
+    except Exception:
+        get_flops_with_torch_profiler = None
+    return get_num_params, get_flops, get_flops_with_torch_profiler
+
+
+def build_fused_model_stats_module(base_model: Any) -> Any:
+    module = deepcopy(getattr(base_model, "model", base_model))
+    try:
+        module.to("cpu")
+    except Exception:
+        pass
+    try:
+        module.float()
+    except Exception:
+        pass
+    try:
+        module.eval()
+    except Exception:
+        pass
+    try:
+        for parameter in module.parameters():
+            parameter.requires_grad = False
+    except Exception:
+        pass
+    fuse = getattr(module, "fuse", None)
+    if callable(fuse):
+        try:
+            module = fuse(verbose=False)
+        except TypeError:
+            module = fuse()
+    return module
+
+
+def measure_model_stats_from_fused_module(
+    fused_model: Any,
+    imgsz: int,
+    get_num_params: Any,
+    get_flops: Any,
+    get_flops_with_torch_profiler: Optional[Any],
+) -> ModelStatsEntry:
+    params = int(get_num_params(fused_model))
+    gflops = float(get_flops(fused_model, imgsz=imgsz))
+    if gflops <= 0.0 and get_flops_with_torch_profiler is not None:
+        gflops = float(get_flops_with_torch_profiler(fused_model, imgsz=imgsz))
+    return ModelStatsEntry(
+        params=params,
+        gflops=(gflops if gflops > 0.0 else None),
+    )
+
+
+def prepare_model_stats_for_model(
+    args: argparse.Namespace,
+    model_name: str,
+    weights_ref: str,
+    imgsz_values: Sequence[int],
+    get_base_model: Any,
+    existing_model_stats: Dict[ModelStatsKey, ModelStatsEntry],
+) -> Dict[ModelStatsKey, ModelStatsEntry]:
+    prepared: Dict[ModelStatsKey, ModelStatsEntry] = {}
+    fallback_entries: Dict[ModelStatsKey, ModelStatsEntry] = {}
+    if not args.measure_model_stats:
+        return prepared
+
+    missing: List[ModelStatsKey] = []
+    for imgsz in sorted({int(value) for value in imgsz_values}):
+        key = ModelStatsKey(model=model_name, weights=weights_ref, imgsz=int(imgsz))
+        entry = existing_model_stats.get(key)
+        if entry is None:
+            entry = load_cached_model_stats(args, key)
+        if entry is not None:
+            fallback_entries[key] = entry
+        if model_stats_entry_complete(entry):
+            prepared[key] = entry  # type: ignore
+        else:
+            missing.append(key)
+
+    if not missing:
+        return prepared
+
+    try:
+        base_model = get_base_model()
+    except Exception as exc:
+        print(
+            "[WARN] Could not load weights for model stats %s: %s" % (model_name, exc)
+        )
+        prepared.update(
+            {
+                key: entry
+                for key, entry in fallback_entries.items()
+                if key not in prepared
+            }
+        )
+        return prepared
+
+    get_num_params = None
+    get_flops = None
+    get_flops_with_torch_profiler = None
+    fused_model = None
+    try:
+        get_num_params, get_flops, get_flops_with_torch_profiler = (
+            ensure_model_stats_imports()
+        )
+        fused_model = build_fused_model_stats_module(base_model)
+        for key in missing:
+            try:
+                entry = measure_model_stats_from_fused_module(
+                    fused_model=fused_model,
+                    imgsz=key.imgsz,
+                    get_num_params=get_num_params,
+                    get_flops=get_flops,
+                    get_flops_with_torch_profiler=get_flops_with_torch_profiler,
+                )
+                prepared[key] = entry
+                save_cached_model_stats(args, key, entry)
+            except Exception as exc:
+                print(
+                    "[WARN] Failed to measure model stats for %s imgsz=%s: %s"
+                    % (key.model, key.imgsz, exc)
+                )
+    except Exception as exc:
+        print(
+            "[WARN] Failed to initialize model stat measurement for %s: %s"
+            % (model_name, exc)
+        )
+    finally:
+        fused_model = None
+        gc.collect()
+    prepared.update(
+        {key: entry for key, entry in fallback_entries.items() if key not in prepared}
+    )
+    return prepared
 
 
 def artifact_base_dir(args: argparse.Namespace, key: ArtifactKey) -> Path:
@@ -1710,6 +2049,7 @@ def build_error_row(
     artifact_info: Optional[ArtifactInfo],
     error: str,
     metric_key: str = METRIC_KEY,
+    model_stats: Optional[ModelStatsEntry] = None,
 ) -> Dict[str, Any]:
     expected_artifact = artifact_file_path(args, key)
     artifact_path = (
@@ -1746,6 +2086,16 @@ def build_error_row(
         "resize_mode": "ultralytics_default",
         "conf": float(args.score_thr),
         "max_det": int(args.max_det),
+        "params": (
+            model_stats.params
+            if model_stats is not None and model_stats.params is not None
+            else ""
+        ),
+        "gflops": (
+            model_stats.gflops
+            if model_stats is not None and model_stats.gflops is not None
+            else ""
+        ),
         "speed_preprocess_ms": "",
         "speed_inference_ms": "",
         "speed_postprocess_ms": "",
@@ -1770,6 +2120,7 @@ def build_result_row(
     predict_result: PredictPassResult,
     ap50_95: float,
     metric_key: str,
+    model_stats: Optional[ModelStatsEntry],
 ) -> Dict[str, Any]:
     fps = (
         None
@@ -1795,6 +2146,16 @@ def build_result_row(
         "resize_mode": "ultralytics_default",
         "conf": float(args.score_thr),
         "max_det": int(args.max_det),
+        "params": (
+            model_stats.params
+            if model_stats is not None and model_stats.params is not None
+            else ""
+        ),
+        "gflops": (
+            model_stats.gflops
+            if model_stats is not None and model_stats.gflops is not None
+            else ""
+        ),
         "speed_preprocess_ms": float(predict_result.preprocess_ms),
         "speed_inference_ms": float(predict_result.inference_ms),
         "speed_postprocess_ms": float(predict_result.postprocess_ms),
@@ -1939,9 +2300,15 @@ def prepare_artifacts(
     args: argparse.Namespace,
     YOLO: Any,
     experiments: Sequence[ExperimentSpec],
-) -> Tuple[Dict[ArtifactKey, ArtifactInfo], Dict[ArtifactKey, str]]:
+    existing_model_stats: Dict[ModelStatsKey, ModelStatsEntry],
+) -> Tuple[
+    Dict[ArtifactKey, ArtifactInfo],
+    Dict[ArtifactKey, str],
+    Dict[ModelStatsKey, ModelStatsEntry],
+]:
     prepared: Dict[ArtifactKey, ArtifactInfo] = {}
     errors: Dict[ArtifactKey, str] = {}
+    model_stats: Dict[ModelStatsKey, ModelStatsEntry] = dict(existing_model_stats)
     by_model: Dict[str, List[ExperimentSpec]] = {}
     for experiment in experiments:
         by_model.setdefault(experiment.key.model, []).append(experiment)
@@ -1960,6 +2327,17 @@ def prepare_artifacts(
         unique_keys: Dict[ArtifactKey, ExperimentSpec] = {}
         for experiment in model_experiments:
             unique_keys[experiment.key] = experiment
+
+        model_stats.update(
+            prepare_model_stats_for_model(
+                args=args,
+                model_name=model_name,
+                weights_ref=weights_ref,
+                imgsz_values=[experiment.key.imgsz for experiment in model_experiments],
+                get_base_model=get_base_model,
+                existing_model_stats=model_stats,
+            )
+        )
 
         for key in sorted(
             unique_keys,
@@ -1989,7 +2367,7 @@ def prepare_artifacts(
 
         release_yolo_runtime(base_model, args.device)
         base_model = None
-    return prepared, errors
+    return prepared, errors, model_stats
 
 
 def benchmark_round_robin(
@@ -1998,6 +2376,7 @@ def benchmark_round_robin(
     experiments: Sequence[ExperimentSpec],
     prepared: Dict[ArtifactKey, ArtifactInfo],
     prepare_errors: Dict[ArtifactKey, str],
+    model_stats: Dict[ModelStatsKey, ModelStatsEntry],
     source_bundle: SourceBundle,
     existing_success: Set[RowKey],
     existing_metric_rows: Dict[MetricLookupKey, MetricCacheEntry],
@@ -2029,6 +2408,7 @@ def benchmark_round_robin(
         for experiment in active_experiments:
             key = experiment.key
             weights_ref = experiment.weights_ref
+            stats_entry = model_stats.get(model_stats_lookup_key(key, weights_ref))
             row_key = spec_row_key(
                 framework="ultralytics",
                 key=key,
@@ -2049,6 +2429,7 @@ def benchmark_round_robin(
                     weights_ref=weights_ref,
                     artifact_info=artifact_info,
                     error=prep_error or "Artifact preparation failed.",
+                    model_stats=stats_entry,
                 )
                 write_csv([row], args.out_csv)
                 print_row_summary(row)
@@ -2109,6 +2490,7 @@ def benchmark_round_robin(
                     predict_result=predict_result,
                     ap50_95=float(metric_entry.ap50_95),
                     metric_key=str(metric_entry.metric_key),
+                    model_stats=stats_entry,
                 )
             except Exception as exc:
                 row = build_error_row(
@@ -2123,6 +2505,7 @@ def benchmark_round_robin(
                         if metric_key_lookup in metric_cache
                         else METRIC_KEY
                     ),
+                    model_stats=stats_entry,
                 )
             finally:
                 gc_cuda_barrier(args.device)
@@ -2165,8 +2548,16 @@ def main() -> None:
     existing_metric_rows = (
         load_existing_metric_rows(args.out_csv) if args.resume else {}
     )
+    existing_model_stats_rows = (
+        load_existing_model_stats_rows(args.out_csv) if args.resume else {}
+    )
 
-    prepared, prepare_errors = prepare_artifacts(args, YOLO, experiments)
+    prepared, prepare_errors, model_stats = prepare_artifacts(
+        args,
+        YOLO,
+        experiments,
+        existing_model_stats_rows,
+    )
     gc_cuda_barrier(args.device)
 
     if args.prepare_only:
@@ -2180,6 +2571,7 @@ def main() -> None:
         experiments=experiments,
         prepared=prepared,
         prepare_errors=prepare_errors,
+        model_stats=model_stats,
         source_bundle=source_bundle,
         existing_success=existing_success,
         existing_metric_rows=existing_metric_rows,
