@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import hashlib
 import json
 import math
@@ -103,7 +104,7 @@ FIELDNAMES = [
 ]
 METRIC_KEY = "metrics/mAP50-95(B)"
 ARTIFACT_SCHEMA_VERSION = 2
-BENCHMARK_IMPL = "ultralytics_round_robin_artifacts_v4"
+BENCHMARK_IMPL = "ultralytics_round_robin_artifacts_v5_cleanup"
 IMAGE_SUFFIXES = {
     ".bmp",
     ".dng",
@@ -195,6 +196,170 @@ class MetricCacheEntry:
     metric_key: str
 
 
+@lru_cache(maxsize=1)
+def is_jetson_host() -> bool:
+    machine = platform.machine().strip().lower()
+    if machine not in {"aarch64", "arm64"}:
+        return False
+    if Path("/etc/nv_tegra_release").exists():
+        return True
+    for marker in (
+        Path("/sys/devices/soc0/family"),
+        Path("/sys/firmware/devicetree/base/model"),
+    ):
+        try:
+            text = marker.read_text(encoding="utf-8", errors="ignore").lower()
+        except Exception:
+            continue
+        if "jetson" in text or "tegra" in text or "nvidia" in text:
+            return True
+    plat = platform.platform().lower()
+    return "jetson" in plat or "tegra" in plat
+
+
+def default_worker_count() -> int:
+    if is_jetson_host():
+        return 0
+    return min(4, max(1, os.cpu_count() or 1))
+
+
+def gc_cuda_barrier(device: str) -> None:
+    gc.collect()
+    if torch.cuda.is_available() and is_cuda_like_device(device):
+        index = device_index_from_string(device)
+        try:
+            torch.cuda.synchronize(index)
+        except Exception:
+            pass
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+        try:
+            torch.cuda.synchronize(index)
+        except Exception:
+            pass
+    gc.collect()
+
+
+def _best_effort_close(value: Any) -> None:
+    if value is None:
+        return
+    for method_name in ("close", "release"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            try:
+                method()
+            except Exception:
+                pass
+
+
+def _best_effort_setattr(obj: Any, name: str, value: Any) -> None:
+    if obj is None or not hasattr(obj, name):
+        return
+    try:
+        setattr(obj, name, value)
+    except Exception:
+        pass
+
+
+def release_autobackend_resources(autobackend: Any) -> None:
+    if autobackend is None:
+        return
+
+    _best_effort_close(autobackend)
+    backend = getattr(autobackend, "backend", None)
+    for owner in (autobackend, backend):
+        if owner is None:
+            continue
+        _best_effort_close(owner)
+        for attr_name in (
+            "session",
+            "engine",
+            "context",
+            "stream",
+            "cuda_graph",
+            "io_binding",
+            "bindings",
+            "binding_addrs",
+            "input_names",
+            "output_names",
+            "model",
+        ):
+            value = getattr(owner, attr_name, None)
+            _best_effort_close(value)
+            _best_effort_setattr(owner, attr_name, None)
+    _best_effort_setattr(autobackend, "backend", None)
+
+
+def release_predictor_resources(predictor: Any) -> None:
+    if predictor is None:
+        return
+
+    vid_writer = getattr(predictor, "vid_writer", None)
+    if isinstance(vid_writer, dict):
+        for writer in vid_writer.values():
+            _best_effort_close(writer)
+
+    release_autobackend_resources(getattr(predictor, "model", None))
+    for attr_name in (
+        "results",
+        "batch",
+        "dataset",
+        "plotted_img",
+        "source_type",
+        "vid_writer",
+        "windows",
+        "model",
+    ):
+        _best_effort_setattr(predictor, attr_name, None)
+
+
+def release_yolo_runtime(runner: Any, device: str) -> None:
+    try:
+        if runner is not None:
+            release_predictor_resources(getattr(runner, "predictor", None))
+            release_autobackend_resources(getattr(runner, "model", None))
+            for attr_name in ("predictor", "trainer", "metrics", "session", "model"):
+                _best_effort_setattr(runner, attr_name, None)
+    finally:
+        gc_cuda_barrier(device)
+
+
+def run_validation_isolated(
+    YOLO: Any,
+    runtime_path: str,
+    key: ArtifactKey,
+    args: argparse.Namespace,
+) -> ValResult:
+    runner = None
+    try:
+        runner = YOLO(runtime_path)
+        return run_validation(runner, key, args)
+    finally:
+        release_yolo_runtime(runner, args.device)
+
+
+def run_predict_speed_isolated(
+    YOLO: Any,
+    runtime_path: str,
+    key: ArtifactKey,
+    source_bundle: SourceBundle,
+    args: argparse.Namespace,
+) -> PredictPassResult:
+    runner = None
+    try:
+        runner = YOLO(runtime_path)
+        warmup_model(runner, key, source_bundle, args)
+        return run_predict_speed(runner, key, source_bundle, args)
+    finally:
+        release_yolo_runtime(runner, args.device)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -259,7 +424,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--workers",
         type=int,
-        default=min(4, max(1, os.cpu_count() or 1)),
+        default=default_worker_count(),
     )
     parser.add_argument(
         "--artifact-root",
@@ -1310,21 +1475,20 @@ def warmup_model(
     # `batch` argument only applies to directory/video/.txt inputs. Our exported ONNX/TRT artifacts
     # are intentionally static batch=1, so warm up them one image at a time to preserve BCHW=(1,3,H,W).
     for image_path in source_bundle.warmup_images:
-        _ = list(
-            model.predict(
-                source=image_path,
-                imgsz=int(key.imgsz),
-                device=args.device,
-                half=bool(key.half),
-                conf=float(args.score_thr),
-                max_det=int(args.max_det),
-                batch=1,
-                stream=True,
-                save=False,
-                verbose=bool(args.progress),
-                workers=int(args.workers),
-            )
-        )
+        for _ in model.predict(
+            source=image_path,
+            imgsz=int(key.imgsz),
+            device=args.device,
+            half=bool(key.half),
+            conf=float(args.score_thr),
+            max_det=int(args.max_det),
+            batch=1,
+            stream=True,
+            save=False,
+            verbose=bool(args.progress),
+            workers=int(args.workers),
+        ):
+            pass
 
 
 def run_predict_speed(
@@ -1353,12 +1517,17 @@ def run_predict_speed(
         workers=int(args.workers),
     )
 
-    for result in iterator:
-        speed = getattr(result, "speed", {}) or {}
-        pre_total += float(speed.get("preprocess", 0.0) or 0.0)
-        inf_total += float(speed.get("inference", 0.0) or 0.0)
-        post_total += float(speed.get("postprocess", 0.0) or 0.0)
-        num_images += 1
+    result = None
+    try:
+        for result in iterator:
+            speed = getattr(result, "speed", {}) or {}
+            pre_total += float(speed.get("preprocess", 0.0) or 0.0)
+            inf_total += float(speed.get("inference", 0.0) or 0.0)
+            post_total += float(speed.get("postprocess", 0.0) or 0.0)
+            num_images += 1
+    finally:
+        result = None
+        iterator = None
 
     wall_time_s = time.perf_counter() - wall_start
     denom = float(max(1, num_images))
@@ -1815,6 +1984,10 @@ def prepare_artifacts(
                 errors[key] = str(exc)
                 if args.prepare_only:
                     print_prepared_or_error(key, None, str(exc))
+            finally:
+                gc_cuda_barrier(args.device)
+
+        release_yolo_runtime(base_model, args.device)
         base_model = None
     return prepared, errors
 
@@ -1883,14 +2056,11 @@ def benchmark_round_robin(
                 continue
 
             metric_key_lookup = metric_lookup_key(key, weights_ref, args)
-            runner = None
             try:
                 runtime_path = artifact_or_weights_path(key, artifact_info)
-                runner = YOLO(runtime_path)
-                warmup_model(runner, key, source_bundle, args)
 
                 if args.eval_policy == "every-repeat":
-                    val_result = run_validation(runner, key, args)
+                    val_result = run_validation_isolated(YOLO, runtime_path, key, args)
                     metric_entry = MetricCacheEntry(
                         ap50_95=float(val_result.ap50_95),
                         metric_key=str(val_result.metric_key),
@@ -1914,14 +2084,22 @@ def benchmark_round_robin(
                                 or METRIC_KEY,
                             )
                         else:
-                            val_result = run_validation(runner, key, args)
+                            val_result = run_validation_isolated(
+                                YOLO, runtime_path, key, args
+                            )
                             save_cached_metrics(key, args, artifact_info, val_result)
                             metric_entry = MetricCacheEntry(
                                 ap50_95=float(val_result.ap50_95),
                                 metric_key=str(val_result.metric_key),
                             )
                         metric_cache[metric_key_lookup] = metric_entry
-                    predict_result = run_predict_speed(runner, key, source_bundle, args)
+                    predict_result = run_predict_speed_isolated(
+                        YOLO=YOLO,
+                        runtime_path=runtime_path,
+                        key=key,
+                        source_bundle=source_bundle,
+                        args=args,
+                    )
 
                 row = build_result_row(
                     key=key,
@@ -1947,7 +2125,7 @@ def benchmark_round_robin(
                     ),
                 )
             finally:
-                runner = None
+                gc_cuda_barrier(args.device)
 
             write_csv([row], args.out_csv)
             print_row_summary(row)
@@ -1989,6 +2167,7 @@ def main() -> None:
     )
 
     prepared, prepare_errors = prepare_artifacts(args, YOLO, experiments)
+    gc_cuda_barrier(args.device)
 
     if args.prepare_only:
         print("\nPrepared artifacts under: %s" % args.artifact_root)
