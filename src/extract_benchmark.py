@@ -70,10 +70,10 @@ LATENCY_SOURCE_COLUMNS = {
     "end_to_end": "end_to_end_ms",
 }
 LATENCY_OUTPUT_COLUMNS = {
-    "preprocess": "preprocess_ms",
-    "inference": "inference_ms",
-    "postprocess": "postprocess_ms",
-    "end_to_end": "end_to_end_ms",
+    "preprocess": "pre",
+    "inference": "inf",
+    "postprocess": "post",
+    "end_to_end": "e2e",
 }
 
 
@@ -346,7 +346,7 @@ def load_and_prepare_dataframe(path: str | Path, native_imgsz: int) -> pd.DataFr
     if missing:
         raise SystemExit("Input CSV is missing required columns: " + ", ".join(missing))
 
-    df["model"] = df["model"].astype(str).str.strip()
+    df["network"] = df["model"].astype(str).str.strip()
     df["precision"] = df["precision"].astype(str).map(canonicalize_precision)
     df["format_name"] = df["format_name"].astype(str).map(canonicalize_format)
     df["status"] = df["status"].astype(str).str.strip().str.lower()
